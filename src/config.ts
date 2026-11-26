@@ -47,8 +47,8 @@ const envSchema = z.object({
   SECRETARY_TIMEZONE: z.string().default('Asia/Singapore'),
   // Let the secretary search the web for questions that are not about the group
   SECRETARY_WEB_SEARCH: z.string().default('true').transform(toBool),
-  SECRETARY_MAX_TURNS: z.string().default('40').transform(toInt),
-  SECRETARY_TIMEOUT_MS: z.string().default('600000').transform(toInt),
+  SECRETARY_MAX_TURNS: z.string().default('80').transform(toInt),
+  SECRETARY_TIMEOUT_MS: z.string().default('1200000').transform(toInt),
   // How much recent transcript is placed directly in each prompt (older history is searched on demand)
   SECRETARY_CONTEXT_CHARS: z.string().default('40000').transform(toInt),
   SECRETARY_MAX_CONCURRENT: z.string().default('4').transform(toInt),
@@ -62,6 +62,21 @@ const envSchema = z.object({
   // A recurring schedule may not fire more often than this (minutes)
   SECRETARY_MIN_REPEAT_MINUTES: z.string().default('15').transform(toInt),
   SECRETARY_MAX_SCHEDULES_PER_GROUP: z.string().default('100').transform(toInt),
+  // Scheduled scripts use no Claude, so they may repeat more often (minutes)
+  SECRETARY_MIN_SCRIPT_REPEAT_MINUTES: z.string().default('5').transform(toInt),
+  // Hooks: scripts in the sandbox that react to every message
+  SECRETARY_HOOKS: z.string().default('true').transform(toBool),
+  // How many times per hour hooks may hand a message to the secretary (the only hook action that uses Claude)
+  SECRETARY_HOOK_ASKS_PER_HOUR: z.string().default('30').transform(toInt),
+  // Daily digests of each group's chat, written by a small model, for long-term recall
+  SECRETARY_DIGESTS: z.string().default('true').transform(toBool),
+  SECRETARY_DIGEST_MODEL: z.string().default('claude-haiku-5-5'),
+  // Weekly backup of all records, sent to the owners' private chats
+  SECRETARY_BACKUPS: z.string().default('true').transform(toBool),
+  // The bot's own repository, so the secretary can propose changes to itself as pull requests
+  BOT_REPO_URL: z.string().default(''),
+  // GitHub token made available inside the sandbox (also set on the sandbox container)
+  SANDBOX_GITHUB_TOKEN: z.string().optional(),
   WORKSPACE_DIR: z.string().default(process.env.HOME || '.'),
   CLAUDE_EXECUTABLE_PATH: z.string().default('claude'),
   CLAUDE_USE_BUNDLED_EXECUTABLE: z

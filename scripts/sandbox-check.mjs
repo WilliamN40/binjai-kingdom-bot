@@ -81,8 +81,8 @@ try {
   r = await call(A, 'ls /run/sandbox; echo x | timeout 3 nc -U /run/sandbox/runner.sock 2>&1; node -e "require(\'net\').createConnection(\'/run/sandbox/runner.sock\').on(\'error\',e=>{console.log(\'ERR\',e.code);process.exit(0)}).on(\'connect\',()=>{console.log(\'CONNECTED\');process.exit(0)})"');
   check('commands cannot reach the runner\'s control socket', !r.stdout.includes('CONNECTED') && /EACCES|Permission denied/.test(out(r)), out(r));
 
-  // SANDBOX_CMD is the command text itself, so it is left out of the search.
-  r = await call(A, 'cat /proc/1/environ 2>&1 | head -c 200; echo; env | grep -v "^SANDBOX_CMD=" | grep -ciE "telegram|anthropic|claude|oauth|token|secret|key" ');
+  // SANDBOX_CMD is the command text itself, and a GitHub token is put there on purpose when configured.
+  r = await call(A, 'cat /proc/1/environ 2>&1 | head -c 200; echo; env | grep -vE "^(SANDBOX_CMD|GH_TOKEN|GITHUB_TOKEN)=" | grep -ciE "telegram|anthropic|claude|oauth|token|secret|key" ');
   check('no secrets are visible (environment, other processes)', /Permission denied/.test(out(r)) && r.stdout.trim().endsWith('0'), out(r));
 
   r = await call(A, 'touch /etc/x /usr/x 2>&1; echo "uid=$(id -u)"; /usr/sbin/iptables -F OUTPUT 2>&1 | head -2; echo "iptables exit=${PIPESTATUS[0]}"; /usr/sbin/iptables -S OUTPUT 2>&1 | head -1');

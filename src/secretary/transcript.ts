@@ -34,7 +34,7 @@ function transcriptDir(chatId: number): string {
 
 const preparedDirs = new Set<number>();
 
-function ensureGroupDir(chatId: number): void {
+export function ensureGroupDir(chatId: number): void {
   if (preparedDirs.has(chatId) && fs.existsSync(transcriptDir(chatId))) return;
   const dir = groupDir(chatId);
   fs.mkdirSync(transcriptDir(chatId), { recursive: true });
@@ -360,4 +360,57 @@ export function migrateGroupData(oldChatId: number, newChatId: number): void {
 export function deleteGroupData(chatId: number): void {
   forgetCaches(chatId);
   fs.rmSync(groupDir(chatId), { recursive: true, force: true });
+}
+
+// ── Whole days and digests ───────────────────────────────────────────
+
+/** Every day that has a transcript, oldest first ("2026-11-26"). */
+export function listTranscriptDays(chatId: number): string[] {
+  return listTranscriptFiles(chatId).map((name) => name.replace('.txt', ''));
+}
+
+export function readTranscriptDay(chatId: number, day: string): string {
+  try {
+    return fs.readFileSync(path.join(transcriptDir(chatId), `${day}.txt`), 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+function digestDir(chatId: number): string {
+  return path.join(groupDir(chatId), 'digests');
+}
+
+export function digestPath(chatId: number, day: string): string {
+  return path.join(digestDir(chatId), `${day}.md`);
+}
+
+export function listDigestDays(chatId: number): string[] {
+  try {
+    return fs
+      .readdirSync(digestDir(chatId))
+      .filter((name) => /^\d{4}-\d{2}-\d{2}\.md$/.test(name))
+      .map((name) => name.replace('.md', ''))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/** The most recent digests that fit in `maxChars`, oldest first, for placing in a prompt. */
+export function readRecentDigests(chatId: number, maxChars: number): string {
+  const picked: string[] = [];
+  let used = 0;
+  for (const day of listDigestDays(chatId).reverse()) {
+    let text: string;
+    try {
+      text = fs.readFileSync(digestPath(chatId, day), 'utf8').trim();
+    } catch {
+      continue;
+    }
+    if (used + text.length > maxChars) break;
+    picked.push(text);
+    used += text.length + 2;
+  }
+  return picked.reverse().join('\n\n');
 }

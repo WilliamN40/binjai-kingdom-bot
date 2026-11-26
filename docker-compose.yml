@@ -17,6 +17,8 @@ services:
     container_name: binjaibot
     restart: unless-stopped
     init: true
+    # On stop or redeploy the bot finishes the answers it is working on first.
+    stop_grace_period: 3m
     depends_on:
       - sandbox
     env_file: .env
@@ -25,15 +27,18 @@ services:
       WORKSPACE_DIR: /data/workspace
       BOT_MODE: prod
       SANDBOX_SOCKET: /run/sandbox/runner.sock
+      # Keep Claude Code's settings file inside the persisted volume below
+      CLAUDE_CONFIG_DIR: /home/node/.claude
     volumes:
       # Transcripts, notes, schedules and bot state: plain files on the host.
       - ./data:/data
       # Claude Code's own state (private-chat sessions).
       - claude-home:/home/node/.claude
       - sandbox-socket:/run/sandbox
-    mem_limit: 2g
+    # Each answer in progress is a separate Claude process of roughly 200 MB.
+    mem_limit: 4g
     cpus: 2
-    pids_limit: 512
+    pids_limit: 1024
     cap_drop:
       - ALL
     security_opt:
@@ -59,6 +64,9 @@ services:
     environment:
       TZ: ${SECRETARY_TIMEZONE:-Asia/Singapore}
       SANDBOX_QUOTA_MB: ${SANDBOX_QUOTA_MB:-1024}
+      # Optional: a GitHub token the groups' scripts may use. Everyone who can ask the
+      # secretary to run commands can use it, so scope it to what they may already do.
+      SANDBOX_GITHUB_TOKEN: ${SANDBOX_GITHUB_TOKEN:-}
     volumes:
       - sandbox-socket:/run/sandbox
       # Each group's workspace (files the secretary creates).

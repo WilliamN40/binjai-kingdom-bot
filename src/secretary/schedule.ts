@@ -14,13 +14,19 @@ import { randomBytes } from 'crypto';
 import { Cron } from 'croner';
 import { config } from '../config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { listGroups } from './state.js';
+import { listGroups, type EffortLevel } from './state.js';
 import { groupDir, localTime } from './transcript.js';
 
 export interface Schedule {
   id: string;
-  kind: 'message' | 'task';
+  /**
+   * message: post the text as is. task: run the secretary with the text as its
+   * instruction. script: run that script from the workspace and post what it prints.
+   */
+  kind: 'message' | 'task' | 'script';
   text: string;
+  /** For tasks: how hard the secretary should think on this run. Default is the group's setting. */
+  effort?: EffortLevel;
   /** Five-field cron pattern for a recurring schedule, in the group's timezone. */
   cron?: string;
   /** Local date-time for a one-off schedule, e.g. "2026-12-01T09:00". */
@@ -36,8 +42,9 @@ export interface Schedule {
 }
 
 export interface ScheduleInput {
-  kind: 'message' | 'task';
+  kind: 'message' | 'task' | 'script';
   text: string;
+  effort?: EffortLevel;
   at?: string;
   cron?: string;
   threadId?: number;
@@ -82,6 +89,9 @@ function nextOccurrence(schedule: Pick<Schedule, 'cron' | 'at'>, from: Date): Da
 export function createSchedule(chatId: number, input: ScheduleInput): Schedule {
   const text = input.text.trim();
   if (!text) throw new Error('The reminder needs some text.');
+  if (input.kind === 'script' && (!/^[A-Za-z0-9_][\w./-]{0,199}$/.test(text) || text.split('/').includes('..'))) {
+    throw new Error('For a script schedule, the text must be the path of a script in the workspace, e.g. scripts/check_prs.py.');
+  }
   if (Boolean(input.at) === Boolean(input.cron)) {
     throw new Error('Give either "at" (one time) or "cron" (repeating), not both.');
   }
@@ -118,10 +128,11 @@ export function createSchedule(chatId: number, input: ScheduleInput): Schedule {
       throw new Error(`Not a valid cron pattern: ${(error as Error).message}`);
     }
     if (!runs.length) throw new Error('That pattern never fires.');
-    const minGapMs = config.SECRETARY_MIN_REPEAT_MINUTES * 60_000;
+    // Scripts use no Claude, so they may run more often than reminders and tasks.
+    const minMinutes = input.kind === 'script' ? config.SECRETARY_MIN_SCRIPT_REPEAT_MINUTES : config.SECRETARY_MIN_REPEAT_MINUTES;
     for (let i = 1; i < runs.length; i++) {
-      if (runs[i].getTime() - runs[i - 1].getTime() < minGapMs) {
-        throw new Error(`Repeating schedules can fire at most every ${config.SECRETARY_MIN_REPEAT_MINUTES} minutes.`);
+      if (runs[i].getTime() - runs[i - 1].getTime() < minMinutes * 60_000) {
+        throw new Error(`A repeating ${input.kind === 'script' ? 'script' : 'schedule'} can fire at most every ${minMinutes} minutes.`);
       }
     }
     next = runs[0];
@@ -137,6 +148,7 @@ export function createSchedule(chatId: number, input: ScheduleInput): Schedule {
     id,
     kind: input.kind,
     text,
+    effort: input.kind === 'task' ? input.effort : undefined,
     cron: input.cron,
     at: input.at,
     nextRun: next.toISOString(),
@@ -168,7 +180,12 @@ export function describeSchedule(schedule: Schedule): string {
     ? `repeats on cron "${schedule.cron}", next ${localTime(new Date(schedule.nextRun)).stamp}`
     : `once at ${localTime(new Date(schedule.nextRun)).stamp}`;
   const where = schedule.topic ? ` in #${schedule.topic}` : '';
-  const what = schedule.kind === 'task' ? 'task' : 'reminder';
+  const what =
+    schedule.kind === 'task'
+      ? `task${schedule.effort ? ` (effort ${schedule.effort})` : ''}`
+      : schedule.kind === 'script'
+        ? 'script'
+        : 'reminder';
   return `[${schedule.id}] ${what}${where}, ${when}, set by ${schedule.createdBy}: ${schedule.text}`;
 }
 

@@ -28,7 +28,7 @@ import { z } from 'zod';
 import { config } from '../config.js';
 import type { ImageAttachment } from '../providers/types.js';
 import { checkToolUse, SECRETARY_TOOL_PREFIX } from './guard.js';
-import { sandboxUidFor, type GroupState } from './state.js';
+import { EFFORT_LEVELS, sandboxUidFor, type EffortLevel, type GroupState } from './state.js';
 import {
   describeResult,
   readSandboxFile,
@@ -37,12 +37,15 @@ import {
   writeSandboxFile,
 } from './sandbox.js';
 import { cancelSchedule, createSchedule, describeSchedule, listSchedules } from './schedule.js';
+import { describeHook, listHooks, removeHook, saveHook, setHookEnabled } from './hooks.js';
 import {
   appendNote,
+  ensureGroupDir,
   groupDir,
   listTopicNames,
   localTime,
   readNotes,
+  readRecentDigests,
   recentContext,
   transcriptStats,
 } from './transcript.js';
@@ -63,6 +66,8 @@ export interface AskParams {
   sendFile?: (data: Buffer, fileName: string, caption?: string) => Promise<void>;
   /** True when a schedule started this run and nobody is waiting on the other end. */
   scheduled?: boolean;
+  /** Overrides the group's effort level for this run (a scheduled task can carry its own). */
+  effort?: EffortLevel;
 }
 
 export interface AskResult {
@@ -74,9 +79,9 @@ export interface AskResult {
 }
 
 // Secrets the Claude subprocess has no business holding.
-const SECRET_ENV = /TELEGRAM|REDDIT|OWNER_CLAIM/i;
+const SECRET_ENV = /TELEGRAM|REDDIT|OWNER_CLAIM|GITHUB/i;
 
-function subprocessEnv(): Record<string, string | undefined> {
+export function subprocessEnv(): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (!SECRET_ENV.test(key)) env[key] = value;
@@ -120,6 +125,7 @@ You have a private Linux workspace for this group, for work that needs computing
 - Files you create stay in the workspace between questions. write_file creates one directly, and send_file posts one in the chat.
 - When someone asks about a file they sent (a document, video, audio or voice note), it is saved under inbox/ and the question tells you its path. Telegram limits you to files up to 20 MB coming in and 45 MB going out.
 - $RECORD points to a read-only copy of this group's record (transcript/, notes.md, members.json), so a script can analyse the history.
+- git and the GitHub CLI (gh) are installed. ${config.SANDBOX_GITHUB_TOKEN ? 'A GitHub token for this group is set up, so git and gh can reach its repositories.' : 'No GitHub token is set up, so only public repositories are reachable and gh cannot create issues or pull requests.'}
 - A command runs to completion and is then cleaned up; nothing keeps running in the background. For anything that should happen later or repeatedly, use a schedule.
 
 Most questions are answered faster straight from the record. Use the workspace when it earns its keep: numbers, files, charts.`
@@ -130,7 +136,7 @@ Most questions are answered faster straight from the record. Use the workspace w
 
 ## Reminders and recurring tasks
 
-schedule_create sets up something for later. Kind "message" posts the text exactly as written when the time comes. Kind "task" runs you again at that time with the text as your instruction and posts your answer, which suits things like "post a recap of the past week". Use "at" for one local date and time, or "cron" (five fields, timezone ${tz}) to repeat; work the date out from the current time given with the question. Write the text so it makes sense on its own when it fires, since the conversation around it will be gone. The group's schedules are listed with each question, and schedule_cancel removes one by its id. After scheduling, confirm what will happen and when.`
+schedule_create sets up something for later. Kind "message" posts the text exactly as written when the time comes. Kind "task" runs you again at that time with the text as your instruction and posts your answer, which suits things like "post a recap of the past week"; a task can carry its own effort level when someone asks for a lighter or deeper run than usual.${sandboxEnabled() ? ` Kind "script" runs a script from the workspace (give its path as the text) without involving you and posts whatever it prints, or nothing if it prints nothing. It uses no Claude, so prefer it for routine checks, and it may repeat as often as every ${config.SECRETARY_MIN_SCRIPT_REPEAT_MINUTES} minutes.` : ''} Use "at" for one local date and time, or "cron" (five fields, timezone ${tz}) to repeat; work the date out from the current time given with the question. Write the text so it makes sense on its own when it fires, since the conversation around it will be gone. The group's schedules are listed with each question, and schedule_cancel removes one by its id. After scheduling, confirm what will happen and when.`
     : '';
 
   const house = config.SECRETARY_INSTRUCTIONS.trim()
@@ -141,6 +147,31 @@ schedule_create sets up something for later. Kind "message" posts the text exact
 The owner of this bot asks that your replies follow these rules:
 ${config.SECRETARY_INSTRUCTIONS.trim()}`
     : '';
+
+  const hooks =
+    sandboxEnabled() && config.SECRETARY_HOOKS
+      ? `
+
+## Hooks
+
+A hook is a script in the workspace's hooks/ folder that the bot runs on every new or edited message in this group, without involving you. Use one when the group wants something to happen automatically when messages arrive: remove messages that match a pattern, answer a recurring question, expand certain links, collect tagged messages.
+
+The script gets one JSON object on stdin and may print one JSON object on stdout.
+- Input: event ("message" or "edit"), topic, message_id, local_time, from {id, name, username}, kind (text, photo, video, voice, file, sticker, poll, event and so on), text, links, file_name, reply_to {message_id, from_name, text}, and raw, which is Telegram's full message object.
+- Output: {"actions": [...]}, or nothing at all. The actions are {"do":"reply","text":"..."}, {"do":"send","text":"..."}, {"do":"react","emoji":"👍"}, {"do":"delete"}, {"do":"pin"}, {"do":"note","text":"..."} and {"do":"ask","prompt":"..."}. "ask" hands the message to you with that instruction; it is the only action that uses Claude, so reserve it for messages that need thought.
+- A script has 5 seconds per message and runs for every message, so keep it fast and have it print nothing in the usual case. Python (.py), Node (.js, .mjs) and bash (.sh) work.
+
+To add a hook: write the script with write_file, test it with run_command by piping a sample JSON object into it, then register it with hook_save. hook_enable switches one off or on, and hook_remove unregisters it. The group's hooks are listed with each question. When you add one, say what it will do and that /hooks off <name> turns it off.`
+      : '';
+
+  const ownCode =
+    sandboxEnabled() && config.BOT_REPO_URL
+      ? `
+
+## Your own code
+
+Your source code is at ${config.BOT_REPO_URL}. When someone wants to change how you work in a way that hooks and scripts cannot, clone the repository into the workspace, make the change on a new branch, run the tests (npm ci, then npm test), push the branch and open a pull request with gh, describing the change and how you tested it. It takes effect only after a maintainer merges and deploys it, so say that when you report back.`
+      : '';
 
   const cannot = config.SECRETARY_SCHEDULES
     ? 'You cannot message people privately or moderate the group.'
@@ -155,13 +186,14 @@ The group's message history is in plain-text files in your working directory:
 - notes.md: things members asked you to remember.
 - members.json: everyone who has spoken, with usernames and message counts.
 - topics.json: the names of the group's topics.
+- digests/YYYY-MM-DD.md: a short summary of each finished day, with its decisions, to-dos, shared links and keywords.
 
 A transcript line looks like this:
 [2026-11-26 21:33] [#Topic name] Alice Tan (@alice) [msg 4521, reply to msg 4519 by Bob Lee]: the text of the message
 
 The topic tag is only present in forum groups. A body starting with "*" is an event (someone joined, a message was pinned, a topic was renamed). "⏎" marks a line break inside a message. Media shows up as a tag such as [photo] or [file: report.pdf]; you cannot see what is in it unless an image is attached to the question. A line marked EDITED is the newer version of the earlier line with the same msg number.${forum}
 
-The latest messages come with each question. For anything older, or anything you do not find there, search the files: Grep transcript/ for names, keywords or dates, then Read around the hits to get the context. People write casually, shorten words and mix languages, so try a few spellings and synonyms before concluding something was never said. The record begins on ${since}; nothing earlier exists. Messages that were later deleted may still be in it, because Telegram does not report deletions.
+The latest messages come with each question. For anything older, or anything you do not find there, search the files. Start with digests/, which is the quick way to find the right day, then Grep transcript/ for names, keywords or dates and Read around the hits to get the exact words. People write casually, shorten words and mix languages, so try a few spellings and synonyms before concluding something was never said. The record begins on ${since}; nothing earlier exists. Messages that were later deleted may still be in it, because Telegram does not report deletions.
 
 ## Answering
 
@@ -169,11 +201,13 @@ Lead with the answer. A secretary's value is in the specifics, so say who said w
 
 Questions that have nothing to do with the group (facts, writing, advice, calculations) are welcome too; just answer them.${web}
 
+Some things go out of date: whether a place is still open, prices, opening hours, job postings, event dates. Before passing those on, confirm each item with a recent source, prefer sources from the past year, and say which ones you could not confirm. A shorter list you have checked is worth more than a longer one you have not.
+
 Reply in the language the person used. Keep it comfortable to read in a chat: a few sentences or a short list for most questions, longer only when someone asks for a full summary. Telegram renders **bold**, _italic_, \`code\`, bullet lists and [links](url); it does not render tables or headings.${links}
 
 ## Remembering
 
-When someone asks you to remember, note down or keep track of something (a decision, a deadline, a task, a preference), save it with the save_note tool and confirm in a few words. Your notes are shown to you with every question.${sandbox}${schedules}${house}
+When someone asks you to remember, note down or keep track of something (a decision, a deadline, a task, a preference), save it with the save_note tool and confirm in a few words. Your notes are shown to you with every question.${sandbox}${schedules}${hooks}${ownCode}${house}
 
 ## Limits
 
@@ -198,6 +232,10 @@ function buildPrompt(params: AskParams): string {
   const sections: string[] = [];
   if (notes) sections.push(`<notes>\n${notes}\n</notes>`);
   if (schedules.length) sections.push(`<schedules>\n${schedules.map(describeSchedule).join('\n')}\n</schedules>`);
+  const hooks = sandboxEnabled() && config.SECRETARY_HOOKS ? listHooks(group.chatId) : [];
+  if (hooks.length) sections.push(`<hooks>\n${hooks.map(describeHook).join('\n')}\n</hooks>`);
+  const digests = readRecentDigests(group.chatId, 6000);
+  if (digests) sections.push(`<recent_digests>\n${digests}\n</recent_digests>`);
   sections.push(
     `<recent_messages>\n${recent || '(nothing has been recorded yet)'}\n</recent_messages>`,
   );
@@ -268,20 +306,29 @@ function secretaryTools(params: AskParams) {
           'Set a reminder or a recurring task for this group. Give exactly one of "at" (one time) or "cron" (repeating).',
           {
             kind: z
-              .enum(['message', 'task'])
-              .describe('"message": post the text as is. "task": run the secretary with the text as its instruction and post the answer.'),
-            text: z.string().min(1).max(2000).describe('The reminder text, or the instruction for a task. Must stand on its own.'),
+              .enum(['message', 'task', 'script'])
+              .describe(
+                '"message": post the text as is. "task": run the secretary with the text as its instruction and post the answer. ' +
+                  '"script": run the workspace script whose path is the text and post what it prints (no Claude involved).',
+              ),
+            text: z
+              .string()
+              .min(1)
+              .max(2000)
+              .describe('The reminder text, the instruction for a task (must stand on its own), or the script path for a script.'),
+            effort: z.enum(EFFORT_LEVELS).optional().describe('Tasks only: effort level for this task, if it should differ from the group setting.'),
             at: z.string().optional().describe(`One-time local date and time, e.g. 2026-12-01T09:00 (${config.SECRETARY_TIMEZONE}).`),
             cron: z
               .string()
               .optional()
               .describe(`Five-field cron pattern in ${config.SECRETARY_TIMEZONE}, e.g. "0 9 * * 1" for Mondays at 09:00.`),
           },
-          async ({ kind, text, at, cron }) => {
+          async ({ kind, text, at, cron, effort }) => {
             try {
               const schedule = createSchedule(chatId, {
                 kind,
                 text,
+                effort,
                 at,
                 cron,
                 threadId: params.threadId,
@@ -304,6 +351,45 @@ function secretaryTools(params: AskParams) {
         async ({ id }) => {
           const removed = cancelSchedule(chatId, id);
           return removed ? ok(`Cancelled: ${describeSchedule(removed)}`) : failed(`There is no schedule with id "${id}".`);
+        },
+      ) as never,
+    );
+  }
+
+  if (sandboxEnabled() && config.SECRETARY_HOOKS) {
+    tools.push(
+      tool(
+        'hook_save',
+        'Register a hook script (or update the one with the same name) so the bot runs it on every message. The script must already exist in hooks/.',
+        {
+          name: z.string().min(1).max(40).describe('Short id: lowercase letters, digits, "-" and "_".'),
+          file: z.string().min(1).max(90).describe('Script file inside hooks/, e.g. "no_spam.py".'),
+          description: z.string().min(1).max(300).describe('One line on what the hook does.'),
+        },
+        async ({ name, file, description }) => {
+          try {
+            return ok(`Registered and switched on. ${describeHook(saveHook(chatId, { name, file, description, createdBy: params.asker }))}`);
+          } catch (error) {
+            return failed((error as Error).message);
+          }
+        },
+      ) as never,
+      tool(
+        'hook_enable',
+        'Switch a registered hook on or off.',
+        { name: z.string().min(1).max(40), enabled: z.boolean() },
+        async ({ name, enabled }) => {
+          const hook = setHookEnabled(chatId, name, enabled);
+          return hook ? ok(describeHook(hook)) : failed(`There is no hook named "${name}".`);
+        },
+      ) as never,
+      tool(
+        'hook_remove',
+        'Unregister a hook. The script file stays in the workspace.',
+        { name: z.string().min(1).max(40) },
+        async ({ name }) => {
+          const hook = removeHook(chatId, name);
+          return hook ? ok(`Removed: ${describeHook(hook)}`) : failed(`There is no hook named "${name}".`);
         },
       ) as never,
     );
@@ -383,6 +469,8 @@ export function buildSecretaryOptions(
   toolsUsed: string[],
 ): Options {
   const { group } = params;
+  // Claude starts in the group folder, so it has to exist even before anything was recorded.
+  ensureGroupDir(group.chatId);
   const root = groupDir(group.chatId);
 
   const ownTools = secretaryTools(params);
@@ -419,7 +507,7 @@ export function buildSecretaryOptions(
   return {
     cwd: root,
     model: config.SECRETARY_MODEL || config.CLAUDE_MODEL,
-    effort: config.SECRETARY_EFFORT,
+    effort: params.effort ?? group.effort ?? config.SECRETARY_EFFORT,
     systemPrompt: buildSystemPrompt(group, params.botName),
     tools: builtinTools,
     allowedTools: [...builtinTools, ...ownToolNames],

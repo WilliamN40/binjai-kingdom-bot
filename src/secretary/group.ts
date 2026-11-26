@@ -4,6 +4,8 @@
  * private-chat coding handlers further down the chain never see group updates.
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { GrammyError, InputFile, type Api, type Context, type NextFunction } from 'grammy';
 import type { BotFullInfo, Message } from 'grammy/types';
 import { config } from '../config.js';
@@ -11,25 +13,33 @@ import { processMessageForTelegram, splitMessage } from '../telegram/markdown.js
 import type { ImageAttachment } from '../providers/types.js';
 import { askSecretary } from './agent.js';
 import { describeContent, formatMessageBody, senderLabel, senderOf, topicNameFromReply } from './format.js';
-import { clearSandbox, sandboxEnabled, uploadToSandbox } from './sandbox.js';
+import { sendBackup } from './backup.js';
+import { describeHook, forgetHooks, hasActiveHooks, listHooks, runHooks, setHookEnabled, type HookOutcome } from './hooks.js';
+import { clearSandbox, runInSandbox, sandboxEnabled, uploadToSandbox } from './sandbox.js';
+import { formatUsage, logUsage } from './usage.js';
 import { describeSchedule, forgetSchedules, listSchedules, type Schedule } from './schedule.js';
 import {
   claimOwnership,
   disableGroup,
   enableGroup,
   getGroup,
+  getOwnerIds,
   isGroupEnabled,
   isOwner,
   listGroups,
   migrateGroupState,
   removeGroup,
   sandboxUidFor,
+  setGroupEffort,
   setWelcome,
+  EFFORT_LEVELS,
+  type EffortLevel,
   touchGroup,
   type GroupState,
 } from './state.js';
 import {
   GENERAL_TOPIC,
+  appendNote,
   appendTranscript,
   deleteGroupData,
   getTopicName,
@@ -54,8 +64,11 @@ export const GROUP_COMMANDS = [
   { command: 'ask', description: 'Ask the secretary about anything said in this group' },
   { command: 'summary', description: 'Recap the discussion (e.g. /summary this week)' },
   { command: 'catchup', description: 'What happened since you last wrote here' },
-  { command: 'reminders', description: 'List reminders and recurring tasks' },
+  { command: 'reminders', description: 'List reminders, recurring tasks and scheduled scripts' },
+  { command: 'hooks', description: 'List the scripts that react to messages (on/off <name>)' },
+  { command: 'usage', description: 'Who used how much Claude (e.g. /usage 7)' },
   { command: 'stop', description: 'Stop the answer the secretary is working on' },
+  { command: 'effort', description: 'Show or set how hard the secretary thinks per answer' },
   { command: 'status', description: 'Show what the secretary is recording' },
   { command: 'help', description: 'How to use the secretary' },
 ];
@@ -313,14 +326,117 @@ interface Ask {
   /** Skip the replied-to message (used by commands that are not about one message). */
   ignoreReply?: boolean;
   previousMessageAt?: Date;
+  /** Name of the hook that handed this message over, when it was not asked by a person. */
+  viaHook?: string;
 }
 
-async function answer(ctx: Context, group: GroupState, msg: Message, topic: string | undefined, ask: Ask): Promise<void> {
-  const api = ctx.api;
+/**
+ * A question is written to disk for as long as it is being answered. If the bot
+ * is restarted or crashes in the middle, the file is still there on the next
+ * start and the question is answered then, instead of being silently dropped.
+ */
+interface PendingAnswer {
+  msg: Message;
+  topic?: string;
+  ask: { question: string; ignoreReply?: boolean; previousMessageAt?: string };
+  startedAt: string;
+  attempts: number;
+}
+
+const PENDING_MAX_AGE_MS = 15 * 60_000;
+const PENDING_MAX_ATTEMPTS = 2;
+
+function pendingDir(): string {
+  return path.join(config.DATA_DIR, 'pending');
+}
+
+function pendingPath(msg: Message): string {
+  return path.join(pendingDir(), `${msg.chat.id}_${msg.message_id}.json`);
+}
+
+function savePending(msg: Message, topic: string | undefined, ask: Ask, attempts: number): void {
+  try {
+    const pending: PendingAnswer = {
+      msg,
+      topic,
+      ask: { question: ask.question, ignoreReply: ask.ignoreReply, previousMessageAt: ask.previousMessageAt?.toISOString() },
+      startedAt: new Date().toISOString(),
+      attempts,
+    };
+    fs.mkdirSync(pendingDir(), { recursive: true });
+    fs.writeFileSync(pendingPath(msg), JSON.stringify(pending));
+  } catch (error) {
+    console.warn('[Secretary] Could not save a pending question:', (error as Error).message);
+  }
+}
+
+function clearPending(msg: Message): void {
+  fs.rmSync(pendingPath(msg), { force: true });
+}
+
+/**
+ * Messages that have already been taken up as a question, so that editing one
+ * (for example to fix a typo) does not get it answered a second time.
+ */
+const takenUp = new Set<string>();
+
+function markTakenUp(msg: Message): boolean {
+  const key = `${msg.chat.id}:${msg.message_id}`;
+  if (takenUp.has(key)) return false;
+  if (takenUp.size > 5000) takenUp.clear();
+  takenUp.add(key);
+  return true;
+}
+
+/**
+ * When answers keep failing (an expired Claude token, a plan limit, a broken deploy),
+ * the people in the group only see "try again". The owners get told what is wrong.
+ */
+const ALERT_AFTER_FAILURES = 3;
+const ALERT_EVERY_MS = 60 * 60_000;
+let consecutiveFailures = 0;
+let lastAlertAt = 0;
+
+function noteAnswerOutcome(api: Api, ok: boolean, reason = ''): void {
+  if (ok) {
+    consecutiveFailures = 0;
+    return;
+  }
+  consecutiveFailures++;
+  if (consecutiveFailures < ALERT_AFTER_FAILURES || Date.now() - lastAlertAt < ALERT_EVERY_MS) return;
+  lastAlertAt = Date.now();
+  const text = `⚠️ The secretary has failed to answer ${consecutiveFailures} times in a row.\nLatest error: ${reason.slice(0, 500)}`;
+  for (const owner of getOwnerIds()) {
+    api.sendMessage(owner, text).catch(() => {});
+  }
+}
+
+/** Answers and scheduled tasks currently running; shutdown waits for this to reach zero. */
+let inFlight = 0;
+
+export function answersInFlight(): number {
+  return inFlight;
+}
+
+async function answer(
+  api: Api,
+  me: BotFullInfo,
+  group: GroupState,
+  msg: Message,
+  topic: string | undefined,
+  ask: Ask,
+  attempt = 1,
+): Promise<void> {
   const chatId = msg.chat.id;
   const target = targetOf(msg);
+  inFlight++;
+  savePending(msg, topic, ask, attempt);
   const stopTyping = startTyping(api, target);
-  api.setMessageReaction(chatId, msg.message_id, [{ type: 'emoji', emoji: '👀' }]).catch(() => {});
+  // Shows the asker their question was picked up. Never allowed to block the answer, but a
+  // failure is logged so it does not go unnoticed.
+  api.setMessageReaction(chatId, msg.message_id, [{ type: 'emoji', emoji: '👀' }]).catch((error) => {
+    console.warn(`[Secretary] Could not react to msg ${msg.message_id} in ${chatId}:`, (error as Error).message);
+  });
 
   const entry: RunningAnswer = { userId: msg.from?.id ?? 0, controller: new AbortController() };
   const active = running.get(chatId) ?? new Set<RunningAnswer>();
@@ -354,7 +470,7 @@ async function answer(ctx: Context, group: GroupState, msg: Message, topic: stri
           threadId: target.threadId,
           repliedTo: replied ? `[${localTime(new Date(replied.date * 1000)).stamp}] ${formatMessageBody(replied)}` : undefined,
           images: attachments.images.length ? attachments.images : undefined,
-          sendFile: fileSender(api, ctx.me, target, topic),
+          sendFile: fileSender(api, me, target, topic),
         },
         entry.controller,
       ),
@@ -363,8 +479,19 @@ async function answer(ctx: Context, group: GroupState, msg: Message, topic: stri
     stopTyping();
     const sent = await sendFormatted(api, target, result.text);
     if (sent) {
-      recordBotMessage(ctx.me, sent, result.text, `reply to msg ${msg.message_id} by ${senderOf(msg).name}`, topic);
+      recordBotMessage(me, sent, result.text, `reply to msg ${msg.message_id} by ${senderOf(msg).name}`, topic);
     }
+
+    noteAnswerOutcome(api, true);
+    logUsage(chatId, {
+      t: new Date().toISOString(),
+      kind: ask.viaHook ? 'hook' : 'ask',
+      userId: msg.from?.id,
+      name: ask.viaHook ?? senderOf(msg).name,
+      costUsd: result.costUsd ?? 0,
+      seconds: Math.round(result.durationMs / 1000),
+      turns: result.turns ?? 0,
+    });
 
     const cost = result.costUsd !== undefined ? ` $${result.costUsd.toFixed(4)}` : '';
     console.log(
@@ -377,6 +504,7 @@ async function answer(ctx: Context, group: GroupState, msg: Message, topic: stri
       console.log(`[Secretary] Answer in ${chatId} was stopped`);
     } else {
       console.error(`[Secretary] Failed to answer in ${chatId}:`, reason);
+      noteAnswerOutcome(api, false, reason);
     }
     const friendly = entry.controller.signal.aborted
       ? 'Stopped.'
@@ -384,14 +512,177 @@ async function answer(ctx: Context, group: GroupState, msg: Message, topic: stri
     await sendPlain(api, target, friendly).catch(() => {});
   } finally {
     active.delete(entry);
-    api.setMessageReaction(chatId, msg.message_id, []).catch(() => {});
+    inFlight--;
+    // Answered, failed or stopped: either way it is settled and must not be retried.
+    clearPending(msg);
+    api.setMessageReaction(chatId, msg.message_id, []).catch((error) => {
+      // "REACTION_EMPTY" only means there was nothing to remove.
+      if (!/REACTION_EMPTY/.test((error as Error).message)) {
+        console.warn(`[Secretary] Could not clear the reaction on msg ${msg.message_id} in ${chatId}:`, (error as Error).message);
+      }
+    });
   }
 }
 
 /** Start an answer without holding up the update queue: recording must keep flowing while Claude thinks. */
-function answerInBackground(ctx: Context, group: GroupState, msg: Message, topic: string | undefined, ask: Ask): void {
-  void answer(ctx, group, msg, topic, ask).catch((error) => {
+function answerInBackground(
+  api: Api,
+  me: BotFullInfo,
+  group: GroupState,
+  msg: Message,
+  topic: string | undefined,
+  ask: Ask,
+  attempt = 1,
+): void {
+  void answer(api, me, group, msg, topic, ask, attempt).catch((error) => {
     console.error('[Secretary] Unexpected error:', error);
+  });
+}
+
+/**
+ * Pick up questions that were cut off by a restart or crash. Called once at startup.
+ * A question is retried once, and only while it is recent enough to still be wanted.
+ */
+export function resumePendingAnswers(api: Api, me: BotFullInfo): number {
+  let files: string[];
+  try {
+    files = fs.readdirSync(pendingDir()).filter((name) => name.endsWith('.json'));
+  } catch {
+    return 0;
+  }
+
+  let resumed = 0;
+  for (const file of files) {
+    const full = path.join(pendingDir(), file);
+    try {
+      const pending = JSON.parse(fs.readFileSync(full, 'utf8')) as PendingAnswer;
+      const group = getGroup(pending.msg.chat.id);
+      const fresh = Date.now() - new Date(pending.startedAt).getTime() <= PENDING_MAX_AGE_MS;
+      if (!group?.enabled || !fresh || pending.attempts >= PENDING_MAX_ATTEMPTS) {
+        fs.rmSync(full, { force: true });
+        continue;
+      }
+      answerInBackground(
+        api,
+        me,
+        group,
+        pending.msg,
+        pending.topic,
+        {
+          question: pending.ask.question,
+          ignoreReply: pending.ask.ignoreReply,
+          previousMessageAt: pending.ask.previousMessageAt ? new Date(pending.ask.previousMessageAt) : undefined,
+        },
+        pending.attempts + 1,
+      );
+      resumed++;
+    } catch {
+      fs.rmSync(full, { force: true });
+    }
+  }
+  return resumed;
+}
+
+// ── Hooks ────────────────────────────────────────────────────────────
+
+const HOOK_ACTIONS_PER_MINUTE = 30;
+const hookActionTimes = new Map<number, number[]>();
+const hookAskTimes = new Map<number, number[]>();
+
+/** Sliding-window limiter: true if another event fits in the window, and counts it. */
+function allow(times: Map<number, number[]>, chatId: number, limit: number, windowMs: number): boolean {
+  const now = Date.now();
+  const recent = (times.get(chatId) ?? []).filter((t) => now - t < windowMs);
+  if (recent.length >= limit) {
+    times.set(chatId, recent);
+    return false;
+  }
+  recent.push(now);
+  times.set(chatId, recent);
+  return true;
+}
+
+async function applyHookActions(
+  api: Api,
+  me: BotFullInfo,
+  group: GroupState,
+  msg: Message,
+  topic: string | undefined,
+  outcomes: HookOutcome[],
+): Promise<void> {
+  const chatId = msg.chat.id;
+  const target = targetOf(msg);
+
+  for (const { hook, actions } of outcomes) {
+    for (const action of actions) {
+      if (!allow(hookActionTimes, chatId, HOOK_ACTIONS_PER_MINUTE, 60_000)) {
+        console.warn(`[Hooks] ${chatId}: more than ${HOOK_ACTIONS_PER_MINUTE} hook actions in a minute, skipping the rest`);
+        return;
+      }
+      try {
+        switch (action.do) {
+          case 'reply': {
+            const sent = await sendFormatted(api, target, action.text);
+            if (sent) recordBotMessage(me, sent, action.text, `hook ${hook.name}, reply to msg ${msg.message_id}`, topic);
+            break;
+          }
+          case 'send': {
+            const sent = await sendFormatted(api, { chatId, threadId: target.threadId }, action.text);
+            if (sent) recordBotMessage(me, sent, action.text, `hook ${hook.name}`, topic);
+            break;
+          }
+          case 'react':
+            await api.setMessageReaction(chatId, msg.message_id, [{ type: 'emoji', emoji: action.emoji as never }]);
+            break;
+          case 'delete':
+            await api.deleteMessage(chatId, msg.message_id);
+            appendTranscript(chatId, new Date(), `* msg ${msg.message_id} from ${senderOf(msg).name} was removed by the hook "${hook.name}"`, topic);
+            break;
+          case 'pin':
+            await api.pinChatMessage(chatId, msg.message_id, { disable_notification: true });
+            break;
+          case 'note':
+            appendNote(chatId, action.text, `hook ${hook.name}`);
+            break;
+          case 'ask':
+            if (!allow(hookAskTimes, chatId, config.SECRETARY_HOOK_ASKS_PER_HOUR, 3_600_000)) {
+              console.warn(`[Hooks] ${chatId}: hourly limit for hooks handing messages to the secretary reached`);
+              break;
+            }
+            // A message the person already addressed to the secretary is not answered twice.
+            if (!markTakenUp(msg)) break;
+            answerInBackground(api, me, group, msg, topic, {
+              question: `This message was handed to you automatically by the hook "${hook.name}", with this instruction: ${action.prompt}`,
+              viaHook: hook.name,
+            });
+            break;
+        }
+      } catch (error) {
+        console.warn(`[Hooks] ${chatId}: "${hook.name}" could not ${action.do}:`, (error as Error).message);
+      }
+    }
+  }
+}
+
+/** Run the group's hooks on one message and carry out what they ask for. Returns how many hooks acted. */
+export async function runHooksOnMessage(
+  api: Api,
+  me: BotFullInfo,
+  group: GroupState,
+  msg: Message,
+  topic: string | undefined,
+  edited: boolean,
+): Promise<number> {
+  if (!sandboxEnabled() || !config.SECRETARY_HOOKS || !hasActiveHooks(group.chatId)) return 0;
+  const outcomes = await runHooks(group.chatId, sandboxUidFor(group.chatId), msg, topic, edited);
+  if (outcomes.length) await applyHookActions(api, me, group, msg, topic, outcomes);
+  return outcomes.length;
+}
+
+/** The same, off the main path, so recording and answering never wait for scripts. */
+function dispatchHooks(api: Api, me: BotFullInfo, group: GroupState, msg: Message, topic: string | undefined, edited: boolean): void {
+  void runHooksOnMessage(api, me, group, msg, topic, edited).catch((error) => {
+    console.warn(`[Hooks] ${group.chatId}: could not run hooks:`, (error as Error).message);
   });
 }
 
@@ -426,7 +717,29 @@ export function createScheduleDeliverer(api: Api, me: BotFullInfo) {
       return;
     }
 
+    if (schedule.kind === 'script') {
+      // Runs in the sandbox without Claude. What it prints is the post; printing nothing posts nothing.
+      const file = schedule.text;
+      const runner = file.endsWith('.py') ? 'python3' : /\.m?js$/.test(file) ? 'node' : 'bash';
+      const result = await runInSandbox(chatId, sandboxUidFor(chatId), `${runner} "$SCHEDULED_SCRIPT"`, 240, { SCHEDULED_SCRIPT: file });
+      const output = result.stdout.trim();
+      if (result.code !== 0) {
+        const why = result.timedOut ? 'ran past its time limit' : (result.stderr.trim().split('\n').pop() ?? `exit code ${result.code}`);
+        console.warn(`[Schedule] Script ${schedule.id} (${file}) in ${chatId} failed: ${why}`);
+        await post(`⚠️ The scheduled script ${file} (${schedule.id}) failed: ${why.slice(0, 300)}`).catch(() => {});
+        return;
+      }
+      if (output) {
+        const text = output.slice(0, 12_000);
+        const sent = await post(text);
+        if (sent) recordBotMessage(me, sent, text, `scheduled script ${schedule.id} (${file})`, schedule.topic);
+      }
+      console.log(`[Schedule] Ran script ${schedule.id} in ${chatId} (${output ? 'posted' : 'nothing to post'})`);
+      return;
+    }
+
     const stopTyping = startTyping(api, target);
+    inFlight++;
     try {
       const result = await answerSlots.run(() =>
         askSecretary({
@@ -437,17 +750,28 @@ export function createScheduleDeliverer(api: Api, me: BotFullInfo) {
           topic: schedule.topic,
           threadId: schedule.threadId,
           scheduled: true,
+          effort: schedule.effort,
           sendFile: fileSender(api, me, target, schedule.topic),
         }),
       );
       stopTyping();
       const sent = await post(result.text);
       if (sent) recordBotMessage(me, sent, result.text, `scheduled task ${schedule.id} set by ${schedule.createdBy}`, schedule.topic);
+      logUsage(chatId, {
+        t: new Date().toISOString(),
+        kind: 'task',
+        name: schedule.text.slice(0, 40),
+        costUsd: result.costUsd ?? 0,
+        seconds: Math.round(result.durationMs / 1000),
+        turns: result.turns ?? 0,
+      });
       console.log(`[Schedule] Ran task ${schedule.id} in ${chatId} (${(result.durationMs / 1000).toFixed(1)}s)`);
     } catch (error) {
       stopTyping();
       console.error(`[Schedule] Task ${schedule.id} in ${chatId} failed:`, (error as Error).message);
       await post(`⚠️ The scheduled task "${schedule.text.slice(0, 80)}" (${schedule.id}) could not be completed this time.`).catch(() => {});
+    } finally {
+      inFlight--;
     }
   };
 }
@@ -462,7 +786,9 @@ function helpText(me: BotFullInfo): string {
     '• /ask <question> — about anything said in the group, or anything else',
     '• /summary [period or focus] — recap, e.g. /summary this week',
     '• /catchup — what happened since you last wrote here',
-    '• /reminders — list reminders and recurring tasks',
+    '• /reminders — list reminders, recurring tasks and scheduled scripts',
+    '• /hooks — scripts that react to messages; /hooks off <name> switches one off',
+    '• /usage [days] — who used how much Claude',
     '• /stop — stop the answer I am working on',
     '• /status — what I am recording',
     '',
@@ -473,8 +799,9 @@ function helpText(me: BotFullInfo): string {
   if (sandboxEnabled()) {
     lines.push('• "Make a spreadsheet of who is coming", "Chart who talks the most" — I can run scripts and send files');
     lines.push('• Reply to a PDF, Word or Excel file and mention me to have it read');
+    lines.push('• "Make a hook that deletes messages containing X", "Run this script every 10 minutes" — automation without asking each time');
   }
-  lines.push('', 'Admins: /welcome <text> sets a greeting for new members. Owner: /enable, /disable, /forget.');
+  lines.push('', 'Admins: /welcome <text> sets a greeting for new members. Owner: /effort <level>, /enable, /disable, /forget.');
   return lines.join('\n');
 }
 
@@ -580,6 +907,7 @@ async function handleGroupCommand(
       }
       deleteGroupData(chatId);
       forgetSchedules(chatId);
+      forgetHooks(chatId);
       removeGroup(chatId);
       await sendPlain(api, target, '🗑 Everything I had for this group has been erased and recording is off.');
       return;
@@ -609,6 +937,62 @@ async function handleGroupCommand(
       return;
     }
 
+    case 'hooks': {
+      const [verb, name] = args.split(/\s+/);
+      if ((verb === 'on' || verb === 'off') && name) {
+        const hook = setHookEnabled(chatId, name, verb === 'on');
+        await sendPlain(api, target, hook ? `Hook "${hook.name}" is now ${verb}.` : `There is no hook named "${name}".`);
+        return;
+      }
+      const hooks = listHooks(chatId);
+      await sendPlain(
+        api,
+        target,
+        hooks.length
+          ? `Hooks (scripts that react to messages):\n\n${hooks.map((h) => `• ${describeHook(h)}`).join('\n')}\n\n/hooks off <name> or /hooks on <name> switches one. Ask me to change or remove one.`
+          : 'No hooks yet. Ask me for one, e.g. "make a hook that reacts with 🔥 whenever someone posts a GitHub link".',
+      );
+      return;
+    }
+
+    case 'usage': {
+      const days = Math.min(Math.max(parseInt(args, 10) || 7, 1), 365);
+      await sendPlain(api, target, formatUsage(chatId, days));
+      return;
+    }
+
+    case 'effort': {
+      const current = group.effort ?? config.SECRETARY_EFFORT;
+      const levels = EFFORT_LEVELS.join(', ');
+      const wanted = args.toLowerCase();
+      if (!wanted) {
+        await sendPlain(
+          api,
+          target,
+          `Effort is ${current}${group.effort ? '' : ' (the default)'}. Levels: ${levels}. ` +
+            'Higher means more thinking and checking per answer: better on hard questions, slower, and it uses more of the Claude plan. ' +
+            'The owner can change it with /effort <level>, or /effort default.',
+        );
+        return;
+      }
+      if (!isOwner(msg.from?.id)) {
+        await sendPlain(api, target, "Only the bot's owner can change the effort level.");
+        return;
+      }
+      if (wanted === 'default') {
+        setGroupEffort(chatId, undefined);
+        await sendPlain(api, target, `Effort is back to the default (${config.SECRETARY_EFFORT}).`);
+        return;
+      }
+      if (!(EFFORT_LEVELS as readonly string[]).includes(wanted)) {
+        await sendPlain(api, target, `"${args}" is not a level. Use one of: ${levels}, or default.`);
+        return;
+      }
+      setGroupEffort(chatId, wanted as EffortLevel);
+      await sendPlain(api, target, `Effort set to ${wanted} for this group (was ${current}). It applies from the next question.`);
+      return;
+    }
+
     case 'status': {
       const stats = transcriptStats(chatId);
       const topics = group.isForum ? ` · ${listTopicNames(chatId).length + 1} topics known` : '';
@@ -618,6 +1002,8 @@ async function handleGroupCommand(
         target,
         `📒 Recording "${group.title}" since ${stats.firstDay ?? 'today'} · ${stats.days} day(s) on file (${formatBytes(stats.bytes)})${topics}` +
           ` · ${schedules} reminder(s)/task(s) · workspace ${sandboxEnabled() ? 'on' : 'off'}` +
+          ` · ${listHooks(chatId).filter((h) => h.enabled).length} hook(s) on` +
+          ` · effort ${group.effort ?? config.SECRETARY_EFFORT}` +
           (await privacyWarning(ctx, chatId)),
       );
       return;
@@ -657,11 +1043,11 @@ async function handleGroupCommand(
         await sendPlain(api, target, 'Ask me something, e.g. "/ask what did we decide about the venue?"');
         return;
       }
-      answerInBackground(ctx, group, msg, recorded.topic, { question: args, previousMessageAt: recorded.previousMessageAt });
+      answerInBackground(api, ctx.me, group, msg, recorded.topic, { question: args, previousMessageAt: recorded.previousMessageAt });
       return;
 
     case 'summary':
-      answerInBackground(ctx, group, msg, recorded.topic, {
+      answerInBackground(api, ctx.me, group, msg, recorded.topic, {
         ignoreReply: true,
         question:
           `Give a recap of the group's discussion${args ? ` for: "${args}"` : ' today'}. ` +
@@ -671,7 +1057,7 @@ async function handleGroupCommand(
       return;
 
     case 'catchup':
-      answerInBackground(ctx, group, msg, recorded.topic, {
+      answerInBackground(api, ctx.me, group, msg, recorded.topic, {
         ignoreReply: true,
         previousMessageAt: recorded.previousMessageAt,
         question:
@@ -798,6 +1184,14 @@ export async function secretaryMiddleware(ctx: Context, next: NextFunction): Pro
       await handleGroups(ctx);
       return;
     }
+    if (/^\/backup(?:@\w+)?\s*$/.test(text) && isOwner(ctx.from?.id)) {
+      try {
+        await sendBackup(ctx.api, 'requested');
+      } catch (error) {
+        await ctx.reply(`Could not make a backup: ${(error as Error).message}`);
+      }
+      return;
+    }
     return next();
   }
 
@@ -832,8 +1226,22 @@ export async function secretaryMiddleware(ctx: Context, next: NextFunction): Pro
     }
   }
 
-  if (edited) return;
-  const fresh = Date.now() / 1000 - msg.date <= ANSWER_MAX_AGE_SECONDS;
+  // Hooks see every new and edited message from people (never the bot's own, never replays).
+  if (enabledGroup && !msg.from?.is_bot && Date.now() / 1000 - (edited ? (msg.edit_date ?? msg.date) : msg.date) <= ANSWER_MAX_AGE_SECONDS) {
+    dispatchHooks(ctx.api, ctx.me, enabledGroup, msg, recorded.topic, edited);
+  }
+
+  // People often send a question, then edit it to add the @mention they forgot.
+  // An edited message is answered only for that case: a mention, and only once.
+  const lastTouched = edited ? (msg.edit_date ?? msg.date) : msg.date;
+  const fresh = Date.now() / 1000 - lastTouched <= ANSWER_MAX_AGE_SECONDS;
+  if (edited) {
+    const editTrigger = detectTrigger(msg, { id: ctx.me.id, username: ctx.me.username ?? '' });
+    if (!enabledGroup || !fresh || editTrigger?.kind !== 'ask' || editTrigger.via !== 'mention' || !editTrigger.question) return;
+    if (!markTakenUp(msg)) return;
+    answerInBackground(ctx.api, ctx.me, enabledGroup, msg, recorded.topic, { question: editTrigger.question });
+    return;
+  }
 
   if (enabledGroup && fresh && msg.new_chat_members?.length) {
     await greetNewMembers(ctx, enabledGroup, msg);
@@ -867,5 +1275,6 @@ export async function secretaryMiddleware(ctx: Context, next: NextFunction): Pro
     }
   }
 
-  answerInBackground(ctx, group, msg, recorded.topic, { question, previousMessageAt: recorded.previousMessageAt });
+  markTakenUp(msg);
+  answerInBackground(ctx.api, ctx.me, group, msg, recorded.topic, { question, previousMessageAt: recorded.previousMessageAt });
 }

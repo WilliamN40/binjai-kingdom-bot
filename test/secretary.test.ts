@@ -18,6 +18,8 @@ const { formatMessageBody, describeContent } = await import('../src/secretary/fo
 const { detectTrigger } = await import('../src/secretary/trigger.js');
 const { checkToolUse } = await import('../src/secretary/guard.js');
 const schedule = await import('../src/secretary/schedule.js');
+const hooks = await import('../src/secretary/hooks.js');
+const usage = await import('../src/secretary/usage.js');
 const NOTE_TOOL = 'mcp__secretary__save_note';
 const transcript = await import('../src/secretary/transcript.js');
 const state = await import('../src/secretary/state.js');
@@ -284,6 +286,103 @@ test('bad schedules are refused with a reason', () => {
   assert.equal(schedule.listSchedules(chatId).length, 0);
 });
 
+test('a script schedule takes a workspace path, may repeat often, and tasks can carry an effort level', () => {
+  const chatId = -1009990014;
+  const script = schedule.createSchedule(chatId, { kind: 'script', text: 'scripts/check_prs.py', cron: '*/5 * * * *', createdBy: 'Alice' });
+  assert.equal(script.kind, 'script');
+  assert.match(schedule.describeSchedule(script), /script.*scripts\/check_prs\.py/);
+  assert.throws(() => schedule.createSchedule(chatId, { kind: 'script', text: '../other/x.py', cron: '*/5 * * * *', createdBy: 'A' }), /path of a script/);
+  assert.throws(() => schedule.createSchedule(chatId, { kind: 'script', text: 'rm -rf x; y.py', cron: '*/5 * * * *', createdBy: 'A' }), /path of a script/);
+  assert.throws(() => schedule.createSchedule(chatId, { kind: 'script', text: 'a.py', cron: '* * * * *', createdBy: 'A' }), /at most every 5 minutes/);
+  assert.throws(() => schedule.createSchedule(chatId, { kind: 'task', text: 'recap', cron: '*/5 * * * *', createdBy: 'A' }), /at most every 15 minutes/);
+
+  const task = schedule.createSchedule(chatId, { kind: 'task', text: 'Deep research', cron: '0 8 * * *', effort: 'high', createdBy: 'Alice' });
+  assert.equal(task.effort, 'high');
+  assert.match(schedule.describeSchedule(task), /task \(effort high\)/);
+  assert.equal(schedule.createSchedule(chatId, { kind: 'message', text: 'hi', cron: '0 9 * * *', effort: 'high', createdBy: 'A' }).effort, undefined);
+});
+
+// ── Hooks ────────────────────────────────────────────────────────────
+
+test('hooks are registered by name, can be switched off, updated and removed', () => {
+  const chatId = -1009990030;
+  const hook = hooks.saveHook(chatId, { name: 'No-Emma', file: 'hooks/no_emma.py', description: 'Deletes messages containing emma', createdBy: 'Alice' });
+  assert.deepEqual([hook.name, hook.file, hook.enabled], ['no-emma', 'no_emma.py', true]);
+  assert.equal(hooks.hasActiveHooks(chatId), true);
+
+  hooks.setHookEnabled(chatId, 'no-emma', false);
+  assert.equal(hooks.hasActiveHooks(chatId), false);
+  hooks.forgetHooks(chatId); // as after a restart
+  assert.equal(hooks.listHooks(chatId)[0].enabled, false);
+
+  hooks.saveHook(chatId, { name: 'no-emma', file: 'no_emma_v2.py', description: 'v2', createdBy: 'Bob' });
+  assert.equal(hooks.listHooks(chatId).length, 1, 'same name updates in place');
+  assert.equal(hooks.listHooks(chatId)[0].file, 'no_emma_v2.py');
+  assert.equal(hooks.listHooks(chatId)[0].enabled, true);
+
+  assert.throws(() => hooks.saveHook(chatId, { name: 'x', file: '../escape.py', description: 'd', createdBy: 'A' }), /directly inside hooks/);
+  assert.throws(() => hooks.saveHook(chatId, { name: 'x', file: 'sub/dir.py', description: 'd', createdBy: 'A' }), /directly inside hooks/);
+  assert.throws(() => hooks.saveHook(chatId, { name: 'x', file: 'thing.exe', description: 'd', createdBy: 'A' }), /directly inside hooks/);
+  assert.throws(() => hooks.saveHook(chatId, { name: 'Bad Name!', file: 'a.py', description: 'd', createdBy: 'A' }), /hook name/);
+
+  assert.equal(hooks.removeHook(chatId, 'no-emma')?.name, 'no-emma');
+  assert.equal(hooks.listHooks(chatId).length, 0);
+});
+
+test('a hook is given a compact description of the message', () => {
+  const event = hooks.buildHookEvent(
+    message({
+      message_id: 77,
+      text: 'see https://github.com/a/b and the docs',
+      entities: [{ type: 'text_link', offset: 31, length: 4, url: 'https://example.com/docs' }],
+      reply_to_message: { message_id: 70, date: 1, chat: CHAT, from: BOB, text: 'where is it?' },
+    }),
+    'Events',
+    false,
+  ) as Record<string, any>;
+  assert.equal(event.event, 'message');
+  assert.equal(event.topic, 'Events');
+  assert.equal(event.kind, 'text');
+  assert.deepEqual(event.from, { id: 111, name: 'Alice Tan', username: 'alice', is_bot: false });
+  assert.deepEqual(event.links, ['https://github.com/a/b', 'https://example.com/docs']);
+  assert.deepEqual(event.reply_to, { message_id: 70, from_name: 'Bob', text: 'where is it?' });
+  assert.equal(event.raw.message_id, 77);
+  assert.equal(hooks.buildHookEvent(message({ photo: [{ file_id: 'x' }], caption: 'c' }), undefined, true).event, 'edit');
+});
+
+// ── Usage ────────────────────────────────────────────────────────────
+
+test('usage is totalled per person over a period', () => {
+  const chatId = -1009990040;
+  const now = new Date('2026-11-26T12:00:00Z');
+  const at = (hoursAgo: number) => new Date(now.getTime() - hoursAgo * 3600_000).toISOString();
+  usage.logUsage(chatId, { t: at(1), kind: 'ask', userId: 1, name: 'Alice', costUsd: 0.1, seconds: 30, turns: 3 });
+  usage.logUsage(chatId, { t: at(2), kind: 'ask', userId: 1, name: 'Alice', costUsd: 0.2, seconds: 60, turns: 5 });
+  usage.logUsage(chatId, { t: at(3), kind: 'ask', userId: 2, name: 'Bob', costUsd: 0.05, seconds: 10, turns: 1 });
+  usage.logUsage(chatId, { t: at(4), kind: 'digest', name: '2026-11-25', costUsd: 0.01, seconds: 5, turns: 1 });
+  usage.logUsage(chatId, { t: at(24 * 10), kind: 'ask', userId: 2, name: 'Bob', costUsd: 9, seconds: 10, turns: 1 });
+
+  const week = usage.summarizeUsage(chatId, 7, now);
+  assert.equal(week.total.runs, 4);
+  assert.equal(week.total.costUsd.toFixed(2), '0.36');
+  assert.deepEqual(week.rows.map((r) => [r.name, r.runs]), [['Alice', 2], ['Bob', 1], ['Daily digest', 1]]);
+  assert.equal(usage.summarizeUsage(chatId, 30, now).total.runs, 5);
+});
+
+// ── Digests ──────────────────────────────────────────────────────────
+
+test('recent digests are offered newest-last and within a size budget', () => {
+  const chatId = -1009990050;
+  for (const [day, text] of [['2026-11-20', 'A'.repeat(100)], ['2026-11-21', 'B'.repeat(100)], ['2026-11-22', 'C'.repeat(100)]] as const) {
+    fs.mkdirSync(path.dirname(transcript.digestPath(chatId, day)), { recursive: true });
+    fs.writeFileSync(transcript.digestPath(chatId, day), text);
+  }
+  assert.deepEqual(transcript.listDigestDays(chatId), ['2026-11-20', '2026-11-21', '2026-11-22']);
+  const two = transcript.readRecentDigests(chatId, 250);
+  assert.equal(two, `${'B'.repeat(100)}\n\n${'C'.repeat(100)}`);
+  assert.equal(transcript.readRecentDigests(chatId, 50), '');
+});
+
 // ── Ownership and groups ─────────────────────────────────────────────
 
 test('the claim code makes exactly one owner', () => {
@@ -308,6 +407,19 @@ test('groups are off until enabled, and stay known after being disabled', () => 
   state.disableGroup(chatId);
   assert.equal(state.isGroupEnabled(chatId), false);
   assert.equal(state.getGroup(chatId)?.title, 'Test');
+});
+
+test('a group’s effort level is remembered, and can go back to the default', () => {
+  const chatId = -1007770010;
+  state.enableGroup(chatId, { title: 'Effort', enabledBy: 111 });
+  assert.equal(state.getGroup(chatId)?.effort, undefined);
+  state.setGroupEffort(chatId, 'high');
+  state.resetStateCache();
+  assert.equal(state.getGroup(chatId)?.effort, 'high');
+  state.enableGroup(chatId, { title: 'Effort renamed', enabledBy: 111 });
+  assert.equal(state.getGroup(chatId)?.effort, 'high', 're-enabling keeps the setting');
+  state.setGroupEffort(chatId, undefined);
+  assert.equal(state.getGroup(chatId)?.effort, undefined);
 });
 
 test('each group gets its own stable sandbox user', () => {

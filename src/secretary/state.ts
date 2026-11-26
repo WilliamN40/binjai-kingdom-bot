@@ -22,7 +22,12 @@ export interface GroupState {
   sandboxUid?: number;
   /** Greeting posted when someone joins. "{name}" and "{group}" are filled in. */
   welcome?: string;
+  /** Reasoning effort for this group's answers; unset means the configured default. */
+  effort?: EffortLevel;
 }
+
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
 
 const SANDBOX_UID_BASE = 20000;
 
@@ -31,6 +36,8 @@ interface State {
   /** One-time code that turns the sender of `/claim <code>` into an owner. */
   claimCode?: string;
   groups: Record<string, GroupState>;
+  /** When the records were last sent to the owners as a backup (ISO time). */
+  lastBackupAt?: string;
 }
 
 const MAX_CLAIM_ATTEMPTS = 5;
@@ -58,6 +65,7 @@ function load(): State {
       ownerIds: Array.isArray(raw.ownerIds) ? raw.ownerIds : [],
       claimCode: typeof raw.claimCode === 'string' ? raw.claimCode : undefined,
       groups: raw.groups && typeof raw.groups === 'object' ? raw.groups : {},
+      lastBackupAt: typeof raw.lastBackupAt === 'string' ? raw.lastBackupAt : undefined,
     };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -175,6 +183,7 @@ export function enableGroup(
     isForum: info.isForum,
     sandboxUid: existing?.sandboxUid,
     welcome: existing?.welcome,
+    effort: existing?.effort,
   };
   s.groups[String(chatId)] = group;
   save();
@@ -218,6 +227,15 @@ export function setWelcome(chatId: number, welcome: string | undefined): void {
   save();
 }
 
+export function setGroupEffort(chatId: number, effort: EffortLevel | undefined): void {
+  const s = load();
+  const group = s.groups[String(chatId)];
+  if (!group) return;
+  if (effort) group.effort = effort;
+  else delete group.effort;
+  save();
+}
+
 /** Keep the stored title / username / forum flag in sync with what Telegram reports. */
 export function touchGroup(
   chatId: number,
@@ -244,6 +262,16 @@ export function migrateGroupState(oldChatId: number, newChatId: number): void {
   if (!group) return;
   delete s.groups[String(oldChatId)];
   s.groups[String(newChatId)] = { ...group, chatId: newChatId };
+  save();
+}
+
+export function getLastBackupAt(): Date | undefined {
+  const value = load().lastBackupAt;
+  return value ? new Date(value) : undefined;
+}
+
+export function setLastBackupAt(date: Date): void {
+  load().lastBackupAt = date.toISOString();
   save();
 }
 

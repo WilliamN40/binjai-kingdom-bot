@@ -12,6 +12,14 @@ RUN apt-get update \
       poppler-utils ffmpeg imagemagick fonts-dejavu-core \
  && rm -rf /var/lib/apt/lists/*
 
+# GitHub CLI, from GitHub's own package repository
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY runner.mjs /opt/sandbox/runner.mjs
 
 # Starts as root only to set the firewall and switch each command to its group's unprivileged user.

@@ -41,10 +41,15 @@ This fork adds a second mode on top of the private-chat coding agent: in a Teleg
 - Answers when it is **@mentioned**, when someone **replies to it**, or via **`/ask`**. Everything else is recorded silently. Anyone in the group can ask; there are no rate limits.
 - `/summary [period or focus]` for a recap, `/catchup` for "what happened since I last wrote here".
 - Remembers things on request ("remember that the AGM moved to 20 Dec") in the group's notes.
-- **Reminders and recurring tasks**: "remind us Friday 6pm to bring the banner", "post a recap every Monday at 9am". `/reminders` lists them.
+- **Reminders, recurring tasks and scheduled scripts**: "remind us Friday 6pm to bring the banner", "post a recap every Monday at 9am", or a script from the workspace run on a timer with no Claude involved. A task can carry its own effort level. `/reminders` lists them.
+- **Hooks**: scripts in the workspace that the bot runs on every message and that can reply, react, pin, delete, save a note or hand the message to the secretary. Ask for one in plain words ("make a hook that deletes messages containing X"); `/hooks` lists them and `/hooks off <name>` switches one off.
+- **GitHub**: `git` and `gh` are in the workspace, with an optional token for the group's repositories. With `BOT_REPO_URL` set, the secretary can propose changes to its own code as pull requests.
+- **Long-term memory**: a small model writes a digest of each finished day (decisions, to-dos, links, keywords), which the secretary searches before the raw transcript.
+- **Housekeeping**: `/usage [days]` shows who used how much Claude; the owners get a weekly backup of all records in their private chat (`/backup` for one now) and a message if answers start failing.
 - **A sandboxed workspace**: it can run scripts, install tools, build spreadsheets and charts, convert files, and send the result into the chat. Reply to a file (PDF, Word, Excel, video, audio) and mention it to have the file processed.
 - Looks at photos it is asked about, and can search the web.
 - `/welcome <text>` (admins) greets new members; `/stop` cancels an answer in progress.
+- `/effort` shows how hard it thinks per answer; the owner can change it per group with `/effort low|medium|high|xhigh|max`.
 
 **Setting it up**
 
@@ -71,7 +76,10 @@ data/
 ├── groups/group_<id>/
 │   ├── transcript/2026-11-26.txt  [2026-11-26 21:33] [#Topic] Alice (@alice) [msg 4521]: …
 │   ├── notes.md                   things it was asked to remember
-│   ├── schedules.json             reminders and recurring tasks
+│   ├── digests/2026-11-26.md      one short summary per finished day
+│   ├── schedules.json             reminders, recurring tasks, scheduled scripts
+│   ├── hooks.json                 which hook scripts are registered and on
+│   ├── usage.jsonl                one line per Claude run
 │   ├── members.json               who has spoken, message counts
 │   └── topics.json                forum topic names
 └── sandbox/group_<id>/            the group's workspace files
@@ -96,7 +104,9 @@ sudo docker compose up -d --build
 sudo docker compose logs -f bot                        # shows the /claim code on first start
 ```
 
-Tests: `npm test` (unit), `npx tsx scripts/smoke-secretary.ts` (live, asks Claude real questions against a throwaway group).
+Past history: export the chat from Telegram Desktop as JSON, copy `result.json` into `data/`, and run `sudo docker exec binjaibot node dist/import-cli.js /data/result.json --chat-id <id>` (add `--dry-run` first to see what it would do).
+
+Tests: `npm test` (unit), `npx tsx scripts/smoke-secretary.ts` (live, asks Claude real questions against a throwaway group). Inside the running container: `scripts/sandbox-check.mjs`, `scripts/e2e-check.mjs`, `scripts/resume-check.mjs` and `scripts/hooks-check.mjs` (usage in each file's header).
 
 ---
 

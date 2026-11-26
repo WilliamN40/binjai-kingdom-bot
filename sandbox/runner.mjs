@@ -38,6 +38,9 @@ const WORK_ROOT = process.env.SANDBOX_WORK_ROOT || '/work';
 const RECORD_ROOT = process.env.SANDBOX_RECORD_ROOT || '/record';
 const BOT_GID = Number(process.env.SANDBOX_BOT_GID || 1000);
 const TZ = process.env.TZ || 'UTC';
+// Optional GitHub token for the groups' own repositories. It is handed to commands on
+// purpose, so everyone who can run commands here can use it: scope it accordingly.
+const GITHUB_TOKEN = process.env.SANDBOX_GITHUB_TOKEN || '';
 
 // Disk quota per group. The workspace lives on the host's disk, so it is watched while a
 // command runs and the command is killed if it pushes the workspace over either limit.
@@ -182,9 +185,13 @@ function usageBytes(work, uid) {
   }
 }
 
+/** Requests currently running per user, across lanes. */
+const activeByUid = new Map();
+
 function execute(request) {
   return new Promise((resolve) => {
     const { group, uid } = request;
+    activeByUid.set(uid, (activeByUid.get(uid) ?? 0) + 1);
     const { work, record } = prepareGroup(group, uid);
     const timeoutMs = Math.min(Math.max(Number(request.timeoutMs) || DEFAULT_TIMEOUT_MS, 1000), MAX_TIMEOUT_MS);
     const limit = request.binary ? MAX_BINARY_OUTPUT : MAX_TEXT_OUTPUT;
@@ -199,6 +206,8 @@ function execute(request) {
       PIP_NO_WARN_SCRIPT_LOCATION: '1',
       PIP_DISABLE_PIP_VERSION_CHECK: '1',
       NPM_CONFIG_UPDATE_NOTIFIER: 'false',
+      ...(GITHUB_TOKEN ? { GH_TOKEN: GITHUB_TOKEN, GITHUB_TOKEN } : {}),
+      GIT_TERMINAL_PROMPT: '0',
       TMPDIR: path.join(work, '.tmp'),
       RECORD: record,
       LANG: 'C.UTF-8',
@@ -277,13 +286,21 @@ function execute(request) {
     const stop = () => {
       clearTimeout(timer);
       clearInterval(quotaWatch);
-      killUser(uid);
+      // This command's own process tree always goes. Everything else the user owns is swept
+      // only when nothing else of theirs is running (a hook must not kill a long command).
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        // already gone
+      }
+      if ((activeByUid.get(uid) ?? 0) <= 1) killUser(uid);
     };
 
     const finish = (code, signal, error) => {
       if (done) return;
       done = true;
       stop();
+      activeByUid.set(uid, Math.max(0, (activeByUid.get(uid) ?? 1) - 1));
       const encode = (name) => Buffer.concat(chunks[name]).toString(request.binary && name === 'stdout' ? 'base64' : 'utf8');
       resolve({
         ok: !error,
@@ -324,12 +341,14 @@ function validate(request) {
   return null;
 }
 
-// One command at a time per group: cleanup after a run kills everything that group's user owns.
+// Two lanes per group, each running one request at a time: "main" for the secretary's
+// commands (which may take minutes) and "hook" for the quick scripts that react to
+// messages, so a long command never holds up the hooks.
 const queues = new Map();
-function enqueue(uid, task) {
-  const previous = queues.get(uid) ?? Promise.resolve();
+function enqueue(key, task) {
+  const previous = queues.get(key) ?? Promise.resolve();
   const next = previous.then(task, task);
-  queues.set(uid, next.catch(() => {}));
+  queues.set(key, next.catch(() => {}));
   return next;
 }
 
@@ -354,7 +373,8 @@ const server = net.createServer({ allowHalfOpen: true }, (socket) => {
     const problem = validate(request);
     if (problem) return reply({ ok: false, error: problem });
     try {
-      reply(await enqueue(request.uid, () => execute(request)));
+      const lane = request.lane === 'hook' ? 'hook' : 'main';
+      reply(await enqueue(`${request.uid}:${lane}`, () => execute(request)));
     } catch (err) {
       reply({ ok: false, error: err.message });
     }
@@ -400,7 +420,7 @@ server.listen(SOCKET_PATH, () => {
   fs.chownSync(SOCKET_PATH, 0, BOT_GID);
   fs.chmodSync(SOCKET_PATH, 0o660);
   fs.chmodSync(WORK_ROOT, 0o711);
-  console.log(`[sandbox] listening on ${SOCKET_PATH} (tz ${TZ}, network: ${network}, quota ${QUOTA_BYTES / 1024 / 1024} MB per group)`);
+  console.log(`[sandbox] listening on ${SOCKET_PATH} (tz ${TZ}, network: ${network}, quota ${QUOTA_BYTES / 1024 / 1024} MB per group, github token: ${GITHUB_TOKEN ? 'set' : 'none'})`);
 });
 
 // One misbehaving request must not take the runner (and every group's sandbox) down with it.

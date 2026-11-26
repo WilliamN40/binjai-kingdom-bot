@@ -6,14 +6,19 @@ import { preventSleep, allowSleep } from './utils/caffeinate.js';
 import { stopCleanup } from './telegram/deduplication.js';
 import { getOwnerIds, getPendingClaimCode, listGroups } from './secretary/state.js';
 import { flushMembers } from './secretary/transcript.js';
-import { createScheduleDeliverer } from './secretary/group.js';
+import { answersInFlight, createScheduleDeliverer, resumePendingAnswers } from './secretary/group.js';
 import { startScheduler, stopScheduler } from './secretary/schedule.js';
 import { sandboxEnabled } from './secretary/sandbox.js';
+import { startDigests, stopDigests } from './secretary/digest.js';
+import { startBackups, stopBackups } from './secretary/backup.js';
 
 // Telegram remembers the update types of whoever configured the bot last, so
 // ask for ours explicitly. edited_message is needed to record edits, and
 // my_chat_member tells us when the bot is added to or removed from a group.
 const ALLOWED_UPDATES = ['message', 'edited_message', 'callback_query', 'my_chat_member'] as const;
+
+// How long a shutdown waits for answers in progress. Keep it under stop_grace_period in docker-compose.yml.
+const SHUTDOWN_WAIT_MS = 150_000;
 
 async function main() {
   console.log('🤖 Starting Claudegram...');
@@ -72,6 +77,14 @@ async function main() {
   // Reminders and recurring tasks. Anything that came due while the bot was down fires now.
   startScheduler(createScheduleDeliverer(bot.api, bot.botInfo));
 
+  // Daily digests for long-term recall, and a weekly backup of the records to the owners.
+  startDigests();
+  startBackups(bot.api);
+
+  // Questions that a restart or crash cut off are answered now.
+  const resumed = resumePendingAnswers(bot.api, bot.botInfo);
+  if (resumed) console.log(`↩️ Resuming ${resumed} question(s) that were interrupted`);
+
   // Start concurrent runner — updates are processed in parallel,
   // with per-chat ordering enforced by the sequentialize middleware in bot.ts.
   // This lets /cancel bypass the per-chat queue and interrupt running queries.
@@ -86,8 +99,18 @@ async function main() {
     allowSleep();
     stopCleanup();
     stopScheduler();
-    flushMembers();
+    stopDigests();
+    stopBackups();
+    // Stop taking new messages (Telegram keeps them for the next start), then let the
+    // answers already in progress finish. Whatever is still running at the deadline
+    // stays saved on disk and is resumed on the next start.
     await runner.stop();
+    if (answersInFlight() > 0) console.log(`⏳ Waiting for ${answersInFlight()} answer(s) to finish...`);
+    const deadline = Date.now() + SHUTDOWN_WAIT_MS;
+    while (answersInFlight() > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    flushMembers();
     process.exit(0);
   };
 

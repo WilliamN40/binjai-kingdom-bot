@@ -33,6 +33,8 @@ interface SandboxRequest {
   timeoutMs?: number;
   /** Return stdout as base64 (for reading files back out of the sandbox). */
   binary?: boolean;
+  /** "hook" requests run beside the secretary's own commands instead of queueing behind them. */
+  lane?: 'main' | 'hook';
 }
 
 export const MAX_SEND_FILE_BYTES = 45_000_000;
@@ -74,8 +76,14 @@ function request(chatId: number, uid: number, body: SandboxRequest): Promise<San
 }
 
 /** Run a shell command in the group's workspace. */
-export function runInSandbox(chatId: number, uid: number, command: string, timeoutSeconds = 60): Promise<SandboxResult> {
-  return request(chatId, uid, { command, timeoutMs: Math.round(timeoutSeconds * 1000) });
+export function runInSandbox(
+  chatId: number,
+  uid: number,
+  command: string,
+  timeoutSeconds = 60,
+  env?: Record<string, string>,
+): Promise<SandboxResult> {
+  return request(chatId, uid, { command, timeoutMs: Math.round(timeoutSeconds * 1000), env });
 }
 
 /**
@@ -124,6 +132,64 @@ export async function readSandboxFile(chatId: number, uid: number, filePath: str
     throw new Error(result.stderr.trim() || `could not read ${filePath}`);
   }
   return Buffer.from(result.stdout, 'base64');
+}
+
+export interface HookScriptResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+const HOOK_TIMEOUT_SECONDS = 5;
+
+// Runs every hook file named in $HOOK_FILES with the event JSON on stdin, each with its own
+// time limit, and prints one tab-separated line per hook: file, exit code, stdout, stderr
+// (the last two base64 encoded so anything a script prints survives the trip).
+const HOOK_DISPATCHER = `
+input=$(cat)
+while IFS= read -r file; do
+  [ -n "$file" ] || continue
+  case "$file" in
+    *.py) runner="python3" ;;
+    *.js|*.mjs) runner="node" ;;
+    *) runner="bash" ;;
+  esac
+  if [ -f "hooks/$file" ]; then
+    out=$(printf '%s' "$input" | timeout ${HOOK_TIMEOUT_SECONDS} $runner "hooks/$file" 2>"$TMPDIR/hook.err")
+    code=$?
+  else
+    out=""; code=127; echo "hooks/$file does not exist" > "$TMPDIR/hook.err"
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$file" "$code" "$(printf '%s' "$out" | head -c 20000 | base64 -w0)" "$(head -c 600 "$TMPDIR/hook.err" 2>/dev/null | base64 -w0)"
+done <<< "$HOOK_FILES"
+`;
+
+/** Run a group's hook scripts against one message. Returns each script's exit code and output. */
+export async function runHookScripts(
+  chatId: number,
+  uid: number,
+  files: string[],
+  eventJson: string,
+): Promise<Map<string, HookScriptResult>> {
+  const result = await request(chatId, uid, {
+    command: HOOK_DISPATCHER,
+    env: { HOOK_FILES: files.join('\n') },
+    stdin: eventJson,
+    timeoutMs: (HOOK_TIMEOUT_SECONDS * files.length + 10) * 1000,
+    lane: 'hook',
+  });
+
+  const results = new Map<string, HookScriptResult>();
+  for (const line of result.stdout.split('\n')) {
+    const [file, code, out, err] = line.split('\t');
+    if (!file || code === undefined) continue;
+    results.set(file, {
+      code: Number(code),
+      stdout: Buffer.from(out ?? '', 'base64').toString('utf8'),
+      stderr: Buffer.from(err ?? '', 'base64').toString('utf8'),
+    });
+  }
+  return results;
 }
 
 /** Render a command result the way the model should see it. */
