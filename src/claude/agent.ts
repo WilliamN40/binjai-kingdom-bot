@@ -137,7 +137,7 @@ Instead of tables, use these alternatives (in order of preference):
 3. Bold headers with list items — best for feature/comparison matrices:
    **Telegram bot** — Grammy v1.31
    **AI agent** — Claude Code SDK v1.0
-   **TTS** — OpenAI gpt-4o-mini-tts
+   **Language** — TypeScript
 
 4. Preformatted code blocks — ONLY for data where alignment matters (ASCII tables):
    \`\`\`
@@ -207,16 +207,6 @@ You have a claudegram_fetch_medium MCP tool that fetches Medium articles (bypass
 Use it when the user shares a Medium URL or asks to read an article — no need to tell them to use a command.
 The user also has a /medium Telegram command for direct use.`;
 
-const EXTRACT_TOOL_PROMPT = `
-
-Media Extract Tool:
-You have a claudegram_extract_media MCP tool that extracts content from YouTube, Instagram, and TikTok URLs.
-Use mode "text" to transcribe videos, "audio" for MP3, "video" for MP4, "all" for everything.
-Audio/video files are sent directly to the user via Telegram as a side effect.
-Use it when the user asks to transcribe, download, or extract media from a URL — no need to tell them to use a command.
-For voice notes sent directly in chat, the user should use /transcribe instead.
-The user also has an /extract Telegram command for direct use.`;
-
 const REASONING_SUMMARY_INSTRUCTIONS = `
 
 Reasoning Summary (required when enabled):
@@ -229,7 +219,6 @@ const TOOL_PROMPTS = [
   config.REDDIT_ENABLED ? REDDIT_TOOL_PROMPT : '',
   config.VREDDIT_ENABLED ? REDDIT_VIDEO_TOOL_PROMPT : '',
   config.MEDIUM_ENABLED ? MEDIUM_TOOL_PROMPT : '',
-  config.EXTRACT_ENABLED ? EXTRACT_TOOL_PROMPT : '',
 ].join('');
 
 const SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}${TOOL_PROMPTS}${config.CLAUDE_REASONING_SUMMARY ? REASONING_SUMMARY_INSTRUCTIONS : ''}`;
@@ -336,7 +325,7 @@ export async function sendToAgent(
   logDangerousModeOperation(sessionKey, 'query', `prompt_length:${message.length} cwd:${session.workingDirectory}`);
 
   // Determine model to use (default to 'opus' to match getModel() default)
-  const effectiveModel = model || chatModels.get(sessionKey) || 'opus';
+  const effectiveModel = model || chatModels.get(sessionKey) || config.CLAUDE_MODEL;
 
   // Initialize timer for tracking query duration (watchdog created inside try with controller)
   const timer = createAgentTimer();
@@ -799,7 +788,7 @@ export function getModel(chatId: number): string {
       chatModels.set(String(chatId), model);
     }
   }
-  return model || 'opus';
+  return model || config.CLAUDE_MODEL;
 }
 
 export function clearModel(chatId: number): void {

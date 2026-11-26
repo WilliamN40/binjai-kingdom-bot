@@ -11,9 +11,10 @@ import {
 import type { Provider, AgentOptions, LoopOptions, AgentResponse, AgentUsage, ModelInfo } from './types.js';
 
 const CLAUDE_MODELS: ModelInfo[] = [
-  { id: 'opus', label: 'opus', description: 'Most capable (default)' },
-  { id: 'sonnet', label: 'sonnet', description: 'Balanced' },
-  { id: 'haiku', label: 'haiku', description: 'Fast & light' },
+  { id: 'claude-opus-5-5', label: 'Opus 5.5', description: 'Default: strong and fast' },
+  { id: 'claude-fable-5-2', label: 'Fable 5.2', description: 'Most capable, slower and pricier' },
+  { id: 'claude-sonnet-5-5', label: 'Sonnet 5.5', description: 'Balanced' },
+  { id: 'claude-haiku-5-5', label: 'Haiku 5.5', description: 'Fast & light' },
 ];
 
 export const claudeProvider: Provider = {

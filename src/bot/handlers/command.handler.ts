@@ -1,4 +1,4 @@
-import { Context, InputFile } from 'grammy';
+import { Context } from 'grammy';
 import { sessionManager } from '../../claude/session-manager.js';
 import {
   clearConversation,
@@ -9,11 +9,7 @@ import {
   isDangerousMode,
   getCachedUsage,
   getActiveProviderName,
-  setActiveProvider,
-  getAvailableProviders,
   getAvailableModels,
-  clearModel,
-  type ProviderName,
   type ModelInfo,
 } from '../../providers/provider-router.js';
 import { config } from '../../config.js';
@@ -31,30 +27,16 @@ import {
 import { createTelegraphFromFile, createTelegraphPage } from '../../telegram/telegraph.js';
 import { isMediumUrl, fetchMediumArticle, FreediumArticle } from '../../medium/freedium.js';
 import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
-import { getTTSSettings, setTTSEnabled, setTTSVoice, setTTSAutoplay } from '../../tts/tts-settings.js';
 import { getTerminalUISettings, setTerminalUIEnabled } from '../../telegram/terminal-settings.js';
 import { getTelegraphSettings, setTelegraphEnabled } from '../../telegram/telegraph-settings.js';
-import { maybeSendVoiceReply } from '../../tts/voice-reply.js';
-import { transcribeFile, downloadTelegramAudio } from '../../audio/transcribe.js';
 import { executeVReddit } from '../../reddit/vreddit.js';
 import { redditFetch, redditFetchBoth, type RedditFetchOptions } from '../../reddit/redditfetch.js';
 import { fmtTokens, getProgressBar } from './message.handler.js';
-import {
-  detectPlatform,
-  platformLabel,
-  isValidUrl,
-  extractMedia,
-  cleanupExtractResult,
-  type ExtractMode,
-  type ExtractResult,
-  type SubtitleFormat,
-} from '../../media/extract.js';
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { execFile, spawn } from 'child_process';
-import { sanitizeError, sanitizePath } from '../../utils/sanitize.js';
+import { sanitizeError } from '../../utils/sanitize.js';
 import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.js';
 import { getSessionKeyFromCtx, parseSessionKey } from '../../utils/session-key.js';
 
@@ -98,20 +80,6 @@ export function resumeCommandMessage(sessionId: string): string {
   return `\`claude --resume ${sessionId}\``;
 }
 
-const OPENAI_TTS_VOICES = [
-  'alloy', 'ash', 'ballad', 'coral',
-  'echo', 'fable', 'nova', 'onyx',
-  'sage', 'shimmer', 'verse', 'marin', 'cedar',
-] as const;
-
-const GROQ_TTS_VOICES = [
-  'autumn', 'diana', 'hannah', 'austin', 'daniel', 'troy',
-] as const;
-
-function getActiveTTSVoices(): readonly string[] {
-  return config.TTS_PROVIDER === 'groq' ? GROQ_TTS_VOICES : OPENAI_TTS_VOICES;
-}
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 const BOTCTL_PATH = path.join(PROJECT_ROOT, 'scripts', 'claudegram-botctl.sh');
@@ -128,8 +96,6 @@ const projectBrowserState = new Map<string, ProjectBrowserState>();
 function botctlExists(): boolean {
   return fs.existsSync(BOTCTL_PATH);
 }
-
-type TTSMenuMode = 'main' | 'voices';
 
 function parseContextOutput(raw: string): string {
   const trimmed = raw.trim();
@@ -225,67 +191,6 @@ async function runClaudeContext(sessionId: string, cwd: string): Promise<string>
       }
     );
   });
-}
-
-function buildTTSMenu(sessionKey: string, mode: TTSMenuMode) {
-  const settings = getTTSSettings(sessionKey);
-  const hasKey = config.TTS_PROVIDER === 'groq' ? !!config.GROQ_API_KEY : !!config.OPENAI_API_KEY;
-  const apiStatus = hasKey ? 'configured' : 'missing';
-  const providerLabel = config.TTS_PROVIDER === 'groq' ? 'Groq Orpheus' : 'OpenAI';
-
-  const statusLine = settings.enabled ? 'ON' : 'OFF';
-  const autoplayLine = settings.autoplay ? 'ON' : 'OFF';
-  const header = `🔊 *Voice Replies*`;
-  const baseText =
-    `${header}\n\n` +
-    `Provider: *${esc(providerLabel)}*\n` +
-    `Status: *${statusLine}*\n` +
-    `Voice: *${esc(settings.voice)}*\n` +
-    `Autoplay: *${autoplayLine}*\n` +
-    `API key: *${esc(apiStatus)}*`;
-
-  if (mode === 'voices') {
-    const voices = getActiveTTSVoices();
-    const voiceRows: { text: string; callback_data: string }[][] = [];
-    const chunkSize = 3;
-    for (let i = 0; i < voices.length; i += chunkSize) {
-      const chunk = voices.slice(i, i + chunkSize);
-      voiceRows.push(chunk.map((voice) => ({
-        text: voice === settings.voice ? `✓ ${voice}` : voice,
-        callback_data: `tts:voice:${voice}`,
-      })));
-    }
-
-    const recommended = config.TTS_PROVIDER === 'groq'
-      ? 'autumn, troy'
-      : 'marin, cedar';
-
-    return {
-      text:
-        `${header}\n\n` +
-        `Pick a voice\\.\nRecommended: ${esc(recommended)}\\.`,
-      keyboard: [
-        ...voiceRows,
-        [{ text: 'Back', callback_data: 'tts:back' }],
-      ],
-    };
-  }
-
-  const autoplayLabel = settings.autoplay ? '✓ Autoplay' : 'Autoplay';
-
-  return {
-    text: baseText,
-    keyboard: [
-      [
-        { text: settings.enabled ? '✓ On' : 'On', callback_data: 'tts:on' },
-        { text: !settings.enabled ? '✓ Off' : 'Off', callback_data: 'tts:off' },
-      ],
-      [
-        { text: `Voice: ${settings.voice}`, callback_data: 'tts:voices' },
-        { text: autoplayLabel, callback_data: 'tts:autoplay' },
-      ],
-    ],
-  };
 }
 
 function buildTelegraphMenu(sessionKey: string) {
@@ -973,68 +878,6 @@ export async function handleTerminalUICallback(ctx: Context): Promise<void> {
   );
 }
 
-export async function handleTTS(ctx: Context): Promise<void> {
-  const keyInfo = getSessionKeyFromCtx(ctx);
-  if (!keyInfo) return;
-  const { sessionKey } = keyInfo;
-
-  const menu = buildTTSMenu(sessionKey, 'main');
-
-  await ctx.reply(menu.text, {
-    parse_mode: 'MarkdownV2',
-    reply_markup: { inline_keyboard: menu.keyboard },
-  });
-}
-
-export async function handleTTSCallback(ctx: Context): Promise<void> {
-  const keyInfo = getSessionKeyFromCtx(ctx);
-  if (!keyInfo) return;
-  const { sessionKey } = keyInfo;
-
-  const data = ctx.callbackQuery?.data;
-  if (!data || !data.startsWith('tts:')) return;
-
-  if (data === 'tts:on') {
-    const hasKey = config.TTS_PROVIDER === 'groq' ? !!config.GROQ_API_KEY : !!config.OPENAI_API_KEY;
-    const keyName = config.TTS_PROVIDER === 'groq' ? 'GROQ_API_KEY' : 'OPENAI_API_KEY';
-    if (!hasKey) {
-      await ctx.answerCallbackQuery({ text: `${keyName} missing. Set it in .env and restart.` });
-      setTTSEnabled(sessionKey, false);
-    } else {
-      setTTSEnabled(sessionKey, true);
-    }
-  } else if (data === 'tts:off') {
-    setTTSEnabled(sessionKey, false);
-  } else if (data === 'tts:autoplay') {
-    const current = getTTSSettings(sessionKey);
-    setTTSAutoplay(sessionKey, !current.autoplay);
-  } else if (data.startsWith('tts:voice:')) {
-    const voice = data.replace('tts:voice:', '');
-    const voices = getActiveTTSVoices();
-    if (voices.includes(voice)) {
-      setTTSVoice(sessionKey, voice);
-    }
-  }
-
-  const mode: TTSMenuMode = data === 'tts:voices' || data.startsWith('tts:voice:')
-    ? 'voices'
-    : 'main';
-  const menu = buildTTSMenu(sessionKey, mode);
-
-  await ctx.answerCallbackQuery();
-  try {
-    await ctx.editMessageText(menu.text, {
-      parse_mode: 'MarkdownV2',
-      reply_markup: { inline_keyboard: menu.keyboard },
-    });
-  } catch (error) {
-    // Ignore "message is not modified" — happens with duplicate callbacks
-    if (!(error instanceof Error && error.message.includes('message is not modified'))) {
-      throw error;
-    }
-  }
-}
-
 export async function handleTelegraphCallback(ctx: Context): Promise<void> {
   const keyInfo = getSessionKeyFromCtx(ctx);
   if (!keyInfo) return;
@@ -1114,11 +957,7 @@ export async function handleContext(ctx: Context): Promise<void> {
     return;
   }
 
-  // Fallback: CLI shell-out approach (Claude only)
-  if (getActiveProviderName(chatId) === 'opencode') {
-    await replyMd(ctx, '⚠️ No usage data yet\\.\n\nSend a message first, then run `/context` again\\.');
-    return;
-  }
+  // Fallback: CLI shell-out approach
   if (!session.claudeSessionId) {
     await replyMd(
       ctx,
@@ -1161,7 +1000,7 @@ export async function handleBotStatus(ctx: Context): Promise<void> {
 
   const mode = config.BOT_MODE === 'prod' ? 'Production' : 'Development';
   const keyInfo = getSessionKeyFromCtx(ctx);
-  const model = keyInfo ? getModel(keyInfo.chatId) : 'opus';
+  const model = keyInfo ? getModel(keyInfo.chatId) : config.CLAUDE_MODEL;
   const streaming = config.STREAMING_MODE || 'streaming';
   const pid = process.pid;
   const memMB = (process.memoryUsage.rss() / 1024 / 1024).toFixed(1);
@@ -1387,54 +1226,6 @@ export async function handleModelCallback(ctx: Context): Promise<void> {
   );
 }
 
-export async function handleProviderCommand(ctx: Context): Promise<void> {
-  const chatId = ctx.chat?.id;
-  if (!chatId) return;
-
-  const providers = getAvailableProviders();
-  const active = getActiveProviderName(chatId);
-
-  const keyboard = providers.map((p) => {
-    const label = p === active ? `✓ ${p}` : p;
-    return [{ text: label, callback_data: `provider:${p}` }];
-  });
-
-  await ctx.reply(
-    `🔌 *Select Provider*\n\n_Current: ${esc(active)}_\n\n• *claude* \\- Claude Code SDK \\(Anthropic\\)\n• *opencode* \\- OpenCode \\(75\\+ LLM providers\\)`,
-    {
-      parse_mode: 'MarkdownV2',
-      reply_markup: {
-        inline_keyboard: keyboard,
-      },
-    }
-  );
-}
-
-export async function handleProviderCallback(ctx: Context): Promise<void> {
-  const chatId = ctx.chat?.id;
-  if (!chatId) return;
-
-  const data = ctx.callbackQuery?.data;
-  if (!data || !data.startsWith('provider:')) return;
-
-  const provider = data.replace('provider:', '') as ProviderName;
-  const providers = getAvailableProviders();
-
-  if (!providers.includes(provider)) {
-    await ctx.answerCallbackQuery({ text: 'Invalid provider' });
-    return;
-  }
-
-  await setActiveProvider(chatId, provider);
-  clearModel(chatId); // Models differ between providers
-
-  await ctx.answerCallbackQuery({ text: `Switched to ${provider}!` });
-  await ctx.editMessageText(
-    `✅ Provider set to *${esc(provider)}*\n\n_Model selection cleared \\— use /model to pick a model\\._`,
-    { parse_mode: 'MarkdownV2' }
-  );
-}
-
 export async function handlePlan(ctx: Context): Promise<void> {
   const keyInfo = getSessionKeyFromCtx(ctx);
   if (!keyInfo) return;
@@ -1481,7 +1272,6 @@ export async function handlePlan(ctx: Context): Promise<void> {
         });
 
         await messageSender.finishStreaming(ctx, response.text);
-        await maybeSendVoiceReply(ctx, response.text);
       } catch (error) {
         await messageSender.cancelStreaming(ctx);
         throw error;
@@ -1540,7 +1330,6 @@ export async function handleExplore(ctx: Context): Promise<void> {
         });
 
         await messageSender.finishStreaming(ctx, response.text);
-        await maybeSendVoiceReply(ctx, response.text);
       } catch (error) {
         await messageSender.cancelStreaming(ctx);
         throw error;
@@ -1688,7 +1477,6 @@ export async function handleLoop(ctx: Context): Promise<void> {
         });
 
         await messageSender.finishStreaming(ctx, response.text);
-        await maybeSendVoiceReply(ctx, response.text);
       } catch (error) {
         await messageSender.cancelStreaming(ctx);
         throw error;
@@ -1739,12 +1527,6 @@ export async function handleTeleport(ctx: Context): Promise<void> {
   const keyInfo = getSessionKeyFromCtx(ctx);
   if (!keyInfo) return;
   const { sessionKey } = keyInfo;
-  const { chatId } = parseSessionKey(sessionKey);
-
-  if (getActiveProviderName(chatId) === 'opencode') {
-    await replyMd(ctx, 'ℹ️ `/teleport` is not available for the OpenCode provider\\.');
-    return;
-  }
 
   const session = sessionManager.getSession(sessionKey);
 
@@ -2235,7 +2017,6 @@ export async function handleRedditActionCallback(ctx: Context): Promise<void> {
                   abortController,
                 });
                 await messageSender.finishStreaming(ctx, response.text);
-                await maybeSendVoiceReply(ctx, response.text);
               } catch (error) {
                 await messageSender.cancelStreaming(ctx);
                 throw error;
@@ -2246,7 +2027,6 @@ export async function handleRedditActionCallback(ctx: Context): Promise<void> {
               setAbortController(sessionKey, abortController);
               const response = await sendToAgent(sessionKey, prompt, { abortController });
               await messageSender.sendMessage(ctx, response.text);
-              await maybeSendVoiceReply(ctx, response.text);
             }
           });
         } catch (error) {
@@ -2560,187 +2340,10 @@ export async function handleVReddit(ctx: Context): Promise<void> {
   await executeVReddit(ctx, args);
 }
 
-// ── /transcribe command ────────────────────────────────────────────
-
-/**
- * Send a transcript as text (short) or .txt document (long).
- * Exported so voice.handler.ts can reuse it for the ForceReply path.
- */
-export async function sendTranscriptResult(ctx: Context, transcript: string): Promise<void> {
-  if (transcript.length <= config.TRANSCRIBE_FILE_THRESHOLD_CHARS) {
-    await messageSender.sendMessage(ctx, transcript);
-  } else {
-    const tmpPath = path.join(os.tmpdir(), `claudegram_transcript_${Date.now()}.txt`);
-    try {
-      fs.writeFileSync(tmpPath, transcript, { encoding: 'utf-8', mode: 0o600 });
-      const inputFile = new InputFile(fs.readFileSync(tmpPath), 'transcript.txt');
-      await ctx.replyWithDocument(inputFile, {
-        caption: `🎤 Transcript (${transcript.length} chars)`,
-      });
-    } finally {
-      try {
-        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-      } catch (e) {
-        console.warn(`[transcribe] Cleanup failed for ${sanitizePath(tmpPath)}:`, sanitizeError(e));
-      }
-    }
-  }
-}
-
-/**
- * Download a Telegram file by file_id → transcribe → send result.
- * Shared helper for reply-to and ForceReply paths.
- */
-async function transcribeAndSend(
-  ctx: Context,
-  fileId: string,
-  mimeHint?: string
-): Promise<void> {
-  if (!config.TRANSCRIBE_ENABLED) {
-    await replyFeatureDisabled(ctx, 'Transcribe');
-    return;
-  }
-
-  const chatId = ctx.chat?.id;
-  if (!chatId) return;
-
-  const ackMsg = await ctx.reply('🎤 Transcribing...', { parse_mode: undefined });
-  let tempFilePath: string | null = null;
-
-  try {
-    const file = await ctx.api.getFile(fileId);
-    if (!file.file_path) throw new Error('Telegram did not return file_path.');
-
-    const ext = mimeHint?.includes('ogg') ? '.ogg'
-      : mimeHint?.includes('mp3') ? '.mp3'
-      : mimeHint?.includes('wav') ? '.wav'
-      : mimeHint?.includes('mp4') ? '.m4a'
-      : '.oga';
-    tempFilePath = path.join(os.tmpdir(), `claudegram_transcribe_${Date.now()}${ext}`);
-
-    await downloadTelegramAudio(config.TELEGRAM_BOT_TOKEN, file.file_path, tempFilePath);
-
-    const buf = fs.readFileSync(tempFilePath);
-    if (!buf.length) throw new Error('Downloaded empty audio file.');
-
-    const transcript = await transcribeFile(tempFilePath);
-
-    // Remove ack
-    try {
-      await ctx.api.deleteMessage(chatId, ackMsg.message_id);
-    } catch (e) {
-      console.debug('[Transcribe] Failed to delete ack message:', e instanceof Error ? e.message : e);
-    }
-
-    await sendTranscriptResult(ctx, transcript);
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error('[Transcribe] Error:', sanitizeError(error));
-    try {
-      await ctx.api.editMessageText(chatId, ackMsg.message_id, `❌ ${errorMessage}`, { parse_mode: undefined });
-    } catch {
-      await ctx.reply(`❌ Transcription error: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
-    }
-  } finally {
-    if (tempFilePath && fs.existsSync(tempFilePath)) {
-      try {
-        fs.unlinkSync(tempFilePath);
-      } catch (e) {
-        console.warn(`[Transcribe] Cleanup failed for ${sanitizePath(tempFilePath)}:`, sanitizeError(e));
-      }
-    }
-  }
-}
-
-export async function handleTranscribe(ctx: Context): Promise<void> {
-  if (!config.TRANSCRIBE_ENABLED) {
-    await replyFeatureDisabled(ctx, 'Transcribe');
-    return;
-  }
-
-  // Path A: reply to a voice/audio/audio-document message
-  const reply = ctx.message?.reply_to_message;
-  if (reply) {
-    const voice = (reply as { voice?: { file_id: string; mime_type?: string } }).voice;
-    const audio = (reply as { audio?: { file_id: string; mime_type?: string } }).audio;
-    const doc = (reply as { document?: { file_id: string; mime_type?: string } }).document;
-
-    const fileId = voice?.file_id
-      || audio?.file_id
-      || (doc?.mime_type?.startsWith('audio/') ? doc.file_id : null);
-    const mime = voice?.mime_type || audio?.mime_type || doc?.mime_type;
-
-    if (fileId) {
-      await transcribeAndSend(ctx, fileId, mime);
-      return;
-    }
-  }
-
-  // Path B: no audio attached — send ForceReply prompt
-  await ctx.reply(
-    '🎤 *Transcribe Audio*\n\n_Send a voice note or audio file:_',
-    {
-      parse_mode: 'MarkdownV2',
-      reply_markup: {
-        force_reply: true,
-        input_field_placeholder: 'Send a voice note or audio file',
-        selective: true,
-      },
-    }
-  );
-}
-
-/**
- * Handle audio messages (message:audio) sent as reply to the Transcribe ForceReply.
- */
-export async function handleTranscribeAudio(ctx: Context): Promise<void> {
-  if (!config.TRANSCRIBE_ENABLED) {
-    await replyFeatureDisabled(ctx, 'Transcribe');
-    return;
-  }
-
-  const replyTo = ctx.message?.reply_to_message;
-  if (!replyTo || !replyTo.from?.is_bot) return;
-  const replyText = (replyTo as { text?: string }).text || '';
-  if (!replyText.includes('Transcribe Audio')) return;
-
-  const audio = ctx.message?.audio;
-  if (!audio) return;
-
-  await transcribeAndSend(ctx, audio.file_id, audio.mime_type);
-}
-
-/**
- * Handle document messages with audio MIME sent as reply to the Transcribe ForceReply.
- */
-export async function handleTranscribeDocument(ctx: Context): Promise<void> {
-  if (!config.TRANSCRIBE_ENABLED) {
-    await replyFeatureDisabled(ctx, 'Transcribe');
-    return;
-  }
-
-  const replyTo = ctx.message?.reply_to_message;
-  if (!replyTo || !replyTo.from?.is_bot) return;
-  const replyText = (replyTo as { text?: string }).text || '';
-  if (!replyText.includes('Transcribe Audio')) return;
-
-  const doc = ctx.message?.document;
-  if (!doc || !doc.mime_type?.startsWith('audio/')) return;
-
-  await transcribeAndSend(ctx, doc.file_id, doc.mime_type);
-}
-
-// ── /extract command ───────────────────────────────────────────────
-
-// Store pending extract URLs keyed by sessionKey so the callback knows what to process
-const pendingExtractUrls = new Map<string, string>();
-
 // TTLs for cleanup (in ms)
-const EXTRACT_URL_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const PROJECT_BROWSER_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
-// Track timestamps for extract URLs and project browser
-const pendingExtractTimestamps = new Map<string, number>();
+// Track timestamps for project browser
 const projectBrowserTimestamps = new Map<string, number>();
 
 /**
@@ -2759,15 +2362,6 @@ const cleanupInterval = setInterval(() => {
     }
   }
 
-  // Clean pendingExtractUrls
-  for (const [key, timestamp] of pendingExtractTimestamps.entries()) {
-    if (now - timestamp > EXTRACT_URL_TTL_MS) {
-      pendingExtractUrls.delete(key);
-      pendingExtractTimestamps.delete(key);
-      console.log(`[cleanup] Removed stale pendingExtractUrls for ${key}`);
-    }
-  }
-
   // Clean projectBrowserState
   for (const [key, timestamp] of projectBrowserTimestamps.entries()) {
     if (now - timestamp > PROJECT_BROWSER_TTL_MS) {
@@ -2778,347 +2372,3 @@ const cleanupInterval = setInterval(() => {
   }
 }, 60_000);
 cleanupInterval.unref();
-
-export async function handleExtract(ctx: Context): Promise<void> {
-  if (!config.EXTRACT_ENABLED) {
-    await replyFeatureDisabled(ctx, 'Extract');
-    return;
-  }
-
-  const text = ctx.message?.text || '';
-  const args = text.split(' ').slice(1).join(' ').trim();
-
-  if (!args) {
-    await ctx.reply(
-      `\u{1F4E5} *Extract Media*\n\n` +
-      `Extract text, audio, or video from a URL\\.\n\n` +
-      `*Supported platforms:*\n` +
-      `\u{25B6}\u{FE0F} YouTube\n` +
-      `\u{1F4F7} Instagram\n` +
-      `\u{1F3B5} TikTok\n\n` +
-      `\u{1F447} _Paste a URL:_`,
-      {
-        parse_mode: 'MarkdownV2',
-        reply_markup: {
-          force_reply: true,
-          input_field_placeholder: 'https://youtube.com/watch?v=...',
-          selective: true,
-        },
-      }
-    );
-    return;
-  }
-
-  await showExtractMenu(ctx, args);
-}
-
-export async function showExtractMenu(ctx: Context, url: string): Promise<void> {
-  if (!config.EXTRACT_ENABLED) {
-    await replyFeatureDisabled(ctx, 'Extract');
-    return;
-  }
-
-  const keyInfo = getSessionKeyFromCtx(ctx);
-  if (!keyInfo) return;
-  const { sessionKey } = keyInfo;
-
-  if (!isValidUrl(url)) {
-    await ctx.reply('\u{274C} Invalid URL\\. Please provide a valid link\\.', { parse_mode: 'MarkdownV2' });
-    return;
-  }
-
-  const platform = detectPlatform(url);
-  if (platform === 'unknown') {
-    await ctx.reply(
-      '\u{26A0}\u{FE0F} Unsupported platform\\. Supported: YouTube, Instagram, TikTok\\.',
-      { parse_mode: 'MarkdownV2' }
-    );
-    return;
-  }
-
-  const label = platformLabel(platform);
-
-  // Store URL for callback (with timestamp for cleanup)
-  pendingExtractUrls.set(sessionKey, url);
-  pendingExtractTimestamps.set(sessionKey, Date.now());
-
-  await ctx.reply(
-    `\u{1F4E5} *Extract from ${esc(label)}*\n\n` +
-    `\`${esc(url.length > 60 ? url.slice(0, 57) + '...' : url)}\`\n\n` +
-    `What do you want?`,
-    {
-      parse_mode: 'MarkdownV2',
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: '\u{1F4DD} Text', callback_data: 'extract:text' },
-            { text: '\u{1F3A7} Audio', callback_data: 'extract:audio' },
-          ],
-          [
-            { text: '\u{1F3AC} Video', callback_data: 'extract:video' },
-            { text: '\u{2728} All', callback_data: 'extract:all' },
-          ],
-        ],
-      },
-    }
-  );
-}
-
-export async function handleExtractCallback(ctx: Context): Promise<void> {
-  if (!config.EXTRACT_ENABLED) {
-    await ctx.answerCallbackQuery({ text: 'Feature disabled' });
-    await replyFeatureDisabled(ctx, 'Extract');
-    return;
-  }
-
-  const data = ctx.callbackQuery?.data;
-  const keyInfo = getSessionKeyFromCtx(ctx);
-  if (!data || !keyInfo) return;
-  const { chatId, sessionKey } = keyInfo;
-
-  // Handle subtitle format selection (extract:subfmt:<format>)
-  if (data.startsWith('extract:subfmt:')) {
-    const subtitleFormat = data.replace('extract:subfmt:', '') as SubtitleFormat;
-    if (!['text', 'srt', 'vtt'].includes(subtitleFormat)) return;
-
-    await ctx.answerCallbackQuery();
-
-    const url = pendingExtractUrls.get(sessionKey);
-    if (!url) {
-      await ctx.reply('\u{26A0}\u{FE0F} Session expired\\. Please send the URL again with `/extract`\\.', {
-        parse_mode: 'MarkdownV2',
-      });
-      return;
-    }
-    pendingExtractUrls.delete(sessionKey);
-    pendingExtractTimestamps.delete(sessionKey);
-
-    // Remove the subtitle format menu
-    try {
-      const menuMsgId = ctx.callbackQuery?.message?.message_id;
-      if (menuMsgId) await ctx.api.deleteMessage(chatId, menuMsgId);
-    } catch (e) {
-      console.debug('[extract] Failed to delete menu message:', e instanceof Error ? e.message : e);
-    }
-
-    await executeExtract(ctx, url, 'text', subtitleFormat);
-    return;
-  }
-
-  const mode = data.replace('extract:', '') as ExtractMode;
-  if (!['text', 'audio', 'video', 'all'].includes(mode)) return;
-
-  await ctx.answerCallbackQuery();
-
-  const url = pendingExtractUrls.get(sessionKey);
-  if (!url) {
-    await ctx.reply('\u{26A0}\u{FE0F} Session expired\\. Please send the URL again with `/extract`\\.', {
-      parse_mode: 'MarkdownV2',
-    });
-    return;
-  }
-
-  // YouTube + Text → show subtitle format submenu (keep URL pending)
-  const platform = detectPlatform(url);
-  if (mode === 'text' && platform === 'youtube') {
-    try {
-      await ctx.editMessageText(
-        `\u{1F4DD} *Subtitle Format*\n\n` +
-        `How would you like the transcript?`,
-        {
-          parse_mode: 'MarkdownV2',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '\u{1F4DD} Plain Text', callback_data: 'extract:subfmt:text' },
-              ],
-              [
-                { text: '\u{1F4CB} SRT', callback_data: 'extract:subfmt:srt' },
-                { text: '\u{1F4C4} VTT', callback_data: 'extract:subfmt:vtt' },
-              ],
-            ],
-          },
-        }
-      );
-    } catch {
-      // If edit fails, send new message
-      await ctx.reply(
-        `\u{1F4DD} *Subtitle Format*\n\nHow would you like the transcript?`,
-        {
-          parse_mode: 'MarkdownV2',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '\u{1F4DD} Plain Text', callback_data: 'extract:subfmt:text' },
-              ],
-              [
-                { text: '\u{1F4CB} SRT', callback_data: 'extract:subfmt:srt' },
-                { text: '\u{1F4C4} VTT', callback_data: 'extract:subfmt:vtt' },
-              ],
-            ],
-          },
-        }
-      );
-    }
-    return;
-  }
-
-  pendingExtractUrls.delete(sessionKey);
-  pendingExtractTimestamps.delete(sessionKey);
-
-  // Remove the menu message
-  try {
-    const menuMsgId = ctx.callbackQuery?.message?.message_id;
-    if (menuMsgId) {
-      await ctx.api.deleteMessage(chatId, menuMsgId);
-    }
-  } catch (e) {
-    console.debug('[extract] Failed to delete menu message:', e instanceof Error ? e.message : e);
-  }
-
-  await executeExtract(ctx, url, mode);
-}
-
-export async function executeExtract(ctx: Context, url: string, mode: ExtractMode, subtitleFormat?: SubtitleFormat): Promise<void> {
-  if (!config.EXTRACT_ENABLED) {
-    await replyFeatureDisabled(ctx, 'Extract');
-    return;
-  }
-
-  const chatId = ctx.chat?.id;
-  if (!chatId) return;
-
-  const ackMsg = await ctx.reply('\u{1F4E5} Processing...', { parse_mode: undefined });
-
-  const updateAck = async (text: string) => {
-    try {
-      await ctx.api.editMessageText(chatId, ackMsg.message_id, text, { parse_mode: undefined });
-    } catch (e) {
-      // Update can fail if message was deleted or content unchanged
-      console.debug('[extract] Failed to update ack message:', e instanceof Error ? e.message : e);
-    }
-  };
-
-  let result: ExtractResult | null = null;
-
-  try {
-    result = await extractMedia({
-      url,
-      mode,
-      subtitleFormat,
-      onProgress: (msg) => updateAck(msg),
-    });
-
-    // Delete ack message
-    try {
-      await ctx.api.deleteMessage(chatId, ackMsg.message_id);
-    } catch (e) {
-      console.debug('[extract] Failed to delete ack message:', e instanceof Error ? e.message : e);
-    }
-
-    // Send results
-    const platform = platformLabel(result.platform);
-    const title = result.title || 'Untitled';
-    const durationStr = result.duration
-      ? ` (${Math.floor(result.duration / 60)}:${String(Math.floor(result.duration % 60)).padStart(2, '0')})`
-      : '';
-
-    // Header
-    const header = `\u{1F4E5} *${esc(platform)}*: ${esc(title)}${esc(durationStr)}`;
-
-    // Send video if available
-    if (result.videoPath && fs.existsSync(result.videoPath)) {
-      try {
-        await ctx.replyWithChatAction('upload_video');
-        await ctx.replyWithVideo(new InputFile(result.videoPath), {
-          caption: `\u{1F3AC} ${title}${durationStr}`,
-          supports_streaming: true,
-        });
-      } catch (videoSendErr) {
-        console.warn('[extract] Failed to send video:', videoSendErr);
-        await ctx.reply('\u{26A0}\u{FE0F} Video file could not be sent (may be too large).', { parse_mode: undefined });
-      }
-    }
-
-    // Send audio if requested (and not already handled by video)
-    if (result.audioPath && fs.existsSync(result.audioPath) && (mode === 'audio' || mode === 'all')) {
-      try {
-        await ctx.replyWithChatAction('upload_voice');
-        await ctx.replyWithAudio(new InputFile(result.audioPath), {
-          title: title,
-          caption: `\u{1F3A7} ${title}${durationStr}`,
-        });
-      } catch (audioSendErr) {
-        console.warn('[extract] Failed to send audio:', audioSendErr);
-        await ctx.reply('\u{26A0}\u{FE0F} Audio file could not be sent.', { parse_mode: undefined });
-      }
-    }
-
-    // Send subtitle file (SRT/VTT) if available
-    if (result.subtitlePath && result.subtitleFormat && fs.existsSync(result.subtitlePath)) {
-      const ext = result.subtitleFormat; // 'srt' or 'vtt'
-      const safeTitle = title.replace(/[^a-zA-Z0-9]/g, '_');
-      const fileName = `${safeTitle}.${ext}`;
-      try {
-        const inputFile = new InputFile(fs.readFileSync(result.subtitlePath), fileName);
-        await ctx.replyWithDocument(inputFile, {
-          caption: `\u{1F4DD} ${ext.toUpperCase()} subtitles for: ${title}${durationStr}`,
-        });
-      } catch (subSendErr) {
-        console.warn('[extract] Failed to send subtitle file:', subSendErr);
-        await ctx.reply('\u{26A0}\u{FE0F} Subtitle file could not be sent.', { parse_mode: undefined });
-      }
-    }
-
-    // Send transcript (plain text from Whisper or YouTube VTT→text)
-    if (result.transcript) {
-      if (result.transcript.length <= config.TRANSCRIBE_FILE_THRESHOLD_CHARS) {
-        await ctx.reply(`${header}\n\n${esc(result.transcript)}`, {
-          parse_mode: 'MarkdownV2',
-        });
-      } else {
-        // Send as .txt file
-        const tmpPath = path.join(os.tmpdir(), `extract_transcript_${Date.now()}.txt`);
-        try {
-          fs.writeFileSync(tmpPath, result.transcript, { encoding: 'utf-8', mode: 0o600 });
-          const inputFile = new InputFile(fs.readFileSync(tmpPath), `${title.replace(/[^a-zA-Z0-9]/g, '_')}_transcript.txt`);
-          await ctx.replyWithDocument(inputFile, {
-            caption: `\u{1F4DD} Transcript (${result.transcript.length} chars)`,
-          });
-        } finally {
-          try {
-            if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-          } catch (e) {
-            console.warn(`[extract] Cleanup failed for ${sanitizePath(tmpPath)}:`, sanitizeError(e));
-          }
-        }
-      }
-    } else if ((mode === 'text' || mode === 'all') && !result.subtitlePath) {
-      // Transcript was expected but empty and no subtitle file was sent either
-      await ctx.reply('\u{26A0}\u{FE0F} No speech detected in the audio.', { parse_mode: undefined });
-    }
-
-    // Show any warnings
-    for (const warning of result.warnings) {
-      await ctx.reply(`\u{26A0}\u{FE0F} ${warning}`, { parse_mode: undefined });
-    }
-
-    // Success summary for non-text modes when no transcript was sent
-    if (mode !== 'text' && !result.transcript) {
-      await ctx.reply(header, { parse_mode: 'MarkdownV2' });
-    }
-
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error('[extract] Error:', sanitizeError(error));
-    try {
-      await ctx.api.editMessageText(chatId, ackMsg.message_id, `\u{274C} ${errorMessage}`, { parse_mode: undefined });
-    } catch {
-      await ctx.reply(`\u{274C} Extraction failed: ${esc(errorMessage)}`, { parse_mode: 'MarkdownV2' });
-    }
-  } finally {
-    if (result) {
-      cleanupExtractResult(result);
-    }
-  }
-}

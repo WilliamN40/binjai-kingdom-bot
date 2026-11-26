@@ -14,7 +14,7 @@
 
 ```
   Telegram  ──▶  Grammy Bot  ──▶  Claude Agent SDK  ──▶  Your Machine
-  voice/text     command router     agentic runtime       bash, files, code
+  text           command router     agentic runtime       bash, files, code
 ```
 
 </div>
@@ -23,9 +23,80 @@
 
 ## What is this?
 
-Claudegram bridges Telegram to a **full Claude Code agent** running locally on your machine. Send a message in Telegram — Claude reads your files, runs commands, writes code, browses Reddit, fetches Medium articles, transcribes voice notes, and speaks responses back. All from your phone.
+Claudegram bridges Telegram to a **full Claude Code agent** running locally on your machine. Send a message in Telegram — Claude reads your files, runs commands, writes code, browses Reddit, and fetches Medium articles. All from your phone.
 
 This is not a simple API wrapper. It's the real Claude Code agent with tool access — Bash, file I/O, code editing, web browsing — packaged behind a Telegram interface with streaming responses, session memory, and rich output formatting.
+
+---
+
+> **Binjai Kingdom Bot** is a fork of [NachoSEO/claudegram](https://github.com/NachoSEO/claudegram). It adds the group secretary described below, a sandbox for running scripts, reminders, and a Docker deployment, updates everything to current Claude models and libraries, and removes the features that needed other paid services (text-to-speech, voice transcription, media extraction, OpenCode).
+
+## Group secretary
+
+This fork adds a second mode on top of the private-chat coding agent: in a Telegram group the bot acts as a **secretary**. It keeps a written record of everything said in the group and answers questions about it.
+
+**What it does in a group**
+
+- Records every message (text, captions, replies, edits, joins, pins, polls, forwarded messages, media as tags) to plain text, one file per day **per group**. In forum groups every line is tagged with its topic, and all topics share one record, so a question asked in one topic can be answered from what was said in another.
+- Answers when it is **@mentioned**, when someone **replies to it**, or via **`/ask`**. Everything else is recorded silently. Anyone in the group can ask; there are no rate limits.
+- `/summary [period or focus]` for a recap, `/catchup` for "what happened since I last wrote here".
+- Remembers things on request ("remember that the AGM moved to 20 Dec") in the group's notes.
+- **Reminders and recurring tasks**: "remind us Friday 6pm to bring the banner", "post a recap every Monday at 9am". `/reminders` lists them.
+- **A sandboxed workspace**: it can run scripts, install tools, build spreadsheets and charts, convert files, and send the result into the chat. Reply to a file (PDF, Word, Excel, video, audio) and mention it to have the file processed.
+- Looks at photos it is asked about, and can search the web.
+- `/welcome <text>` (admins) greets new members; `/stop` cancels an answer in progress.
+
+**Setting it up**
+
+1. Start the bot (see *Deployment* below). On first start the log prints a one-time code: send `/claim <code>` to the bot in a private chat to become its owner.
+2. Add the bot to your group and **make it an admin** (or disable privacy mode in @BotFather with `/setprivacy` before adding it). Otherwise Telegram only shows it commands and mentions, and the record will have gaps.
+3. Send `/enable` in the group. The bot announces that it is now recording. `/disable` pauses it; `/forget confirm` erases everything it holds for that group.
+
+**How it is confined**
+
+Anyone in the group can talk to the secretary, so it is built to be safe to expose:
+
+- The Claude process answering a group gets read-only access to **that group's record folder only**, checked on every tool call. It has no shell and no file-writing tools of its own, and it is not given the Telegram token.
+- Commands and file writes happen in a **separate sandbox container**: no secrets in it, read-only system files, capped CPU, memory, process count and disk (1 GB per group by default), and **one Linux user per group** so groups cannot see each other's files.
+- The sandbox can reach the public internet, but a firewall inside it rejects every private address, so it cannot reach the host, other containers, the local network or the cloud metadata service. Outbound mail ports are blocked. Every command it runs is written to the bot's log.
+- Reminders are delivered by the bot itself; nothing in the sandbox keeps running between commands.
+
+What that leaves: a script in the sandbox can send a group's **own** record and files out to the internet, and what it does online comes from your server's address. For a sandbox with no network at all, see the comment in `docker-compose.yml`.
+
+**Where things live** (`DATA_DIR`, `./data` in the Docker setup)
+
+```
+data/
+├── state.json                     owners and enabled groups
+├── groups/group_<id>/
+│   ├── transcript/2026-11-26.txt  [2026-11-26 21:33] [#Topic] Alice (@alice) [msg 4521]: …
+│   ├── notes.md                   things it was asked to remember
+│   ├── schedules.json             reminders and recurring tasks
+│   ├── members.json               who has spoken, message counts
+│   └── topics.json                forum topic names
+└── sandbox/group_<id>/            the group's workspace files
+```
+
+**Good to know**
+
+- The record starts when the bot is enabled. Telegram gives bots no access to earlier history, and does not tell bots when a message is deleted.
+- Topic names are learned from Telegram's service messages. A topic renamed before the bot arrived shows its original name until it is renamed again.
+- Telegram keeps undelivered messages for about 24 hours, so short downtime leaves no gap. Bots never see messages from other bots.
+- Bots can download files up to 20 MB and send files up to about 50 MB.
+- Long answers are sent as normal messages; Telegraph publishing is off in the Docker setup because those pages are public.
+
+### Deployment (Docker)
+
+```bash
+cp .env.example .env      # set TELEGRAM_BOT_TOKEN and Claude credentials
+mkdir -p data/groups data/workspace data/sandbox
+sudo chown 1000:1000 data data/groups data/workspace   # the bot runs as uid 1000
+sudo chown root:root data/sandbox && sudo chmod 711 data/sandbox
+sudo docker compose up -d --build
+sudo docker compose logs -f bot                        # shows the /claim code on first start
+```
+
+Tests: `npm test` (unit), `npx tsx scripts/smoke-secretary.ts` (live, asks Claude real questions against a throwaway group).
 
 ---
 
@@ -50,11 +121,6 @@ This is not a simple API wrapper. It's the real Claude Code agent with tool acce
 - Original oversized videos archived locally
 - Large threads auto-export to JSON
 
-### Media Extraction
-- `/extract` — YouTube, Instagram, TikTok video/audio/transcript
-- Text, audio (MP3), video (MP4), or all modes
-- Requires yt-dlp, ffmpeg (system binaries)
-
 ### Medium Integration
 - `/medium` — fetch paywalled articles via Freedium
 - Telegraph Instant View, save as Markdown, or both
@@ -63,19 +129,13 @@ This is not a simple API wrapper. It's the real Claude Code agent with tool acce
 </td>
 <td width="50%" valign="top">
 
-### Voice & Audio
-- Send a voice note → transcribed via Groq Whisper → fed to Claude
-- `/transcribe` — standalone transcription (reply-to or prompt)
-- `/tts` — agent responses spoken back as Telegram voice notes
-- 13 voices via OpenAI TTS (`gpt-4o-mini-tts`)
-
 ### Rich Output
 - MarkdownV2 formatting with automatic escaping
 - Telegraph Instant View for long responses & tables
 - Smart chunking that preserves code blocks
 - ForceReply interactive prompts for multi-step commands
 - `/teleport` — fork session to terminal for continued work
-- Inline keyboards for settings (model, mode, TTS, clear)
+- Inline keyboards for settings (model, mode, clear)
 
 ### Terminal UI
 - Terminal-style display with tool status spinners
@@ -84,7 +144,7 @@ This is not a simple API wrapper. It's the real Claude Code agent with tool acce
 
 ### MCP Tools (Intelligent Routing)
 - Talk naturally — Claude auto-uses the right tools
-- Reddit, Medium, YouTube, project management via MCP
+- Reddit, Medium, project management via MCP
 - No explicit commands needed for common tasks
 
 ### Forum Topic Sessions
@@ -172,14 +232,6 @@ Open your bot in Telegram → `/start`
 | `/medium` | Fetch Medium articles via Freedium |
 | `/file` | Download a project file |
 | `/telegraph` | Toggle Instant View for long responses |
-| `/extract <url>` | Download media from YouTube, TikTok, Instagram |
-
-### Voice & TTS
-| Command | Description |
-|---------|-------------|
-| `/tts` | Toggle voice replies, pick voice |
-| `/transcribe` | Transcribe audio to text |
-| *Send voice note* | Auto-transcribed → processed by Claude |
 
 ### Utility
 | Command | Description |
@@ -223,32 +275,6 @@ Pure TypeScript via Freedium mirror — no extra dependencies.
 FREEDIUM_HOST=freedium-mirror.cfd
 MEDIUM_TIMEOUT_MS=15000
 ```
-
-</details>
-
-<details>
-<summary><strong>Voice Transcription — Groq Whisper</strong></summary>
-
-```bash
-# .env
-GROQ_API_KEY=your_groq_key
-GROQ_TRANSCRIBE_PATH=/absolute/path/to/groq_transcribe.py
-```
-
-</details>
-
-<details>
-<summary><strong>Text-to-Speech — OpenAI TTS</strong></summary>
-
-```bash
-# .env
-OPENAI_API_KEY=your_openai_key
-TTS_MODEL=gpt-4o-mini-tts
-TTS_VOICE=coral
-TTS_RESPONSE_FORMAT=opus
-```
-
-13 voices available: `alloy`, `ash`, `ballad`, `cedar`, `coral`, `echo`, `fable`, `marin`, `nova`, `onyx`, `sage`, `shimmer`, `verse`
 
 </details>
 
@@ -298,24 +324,6 @@ All config lives in `.env`. See [`.env.example`](.env.example) for the full anno
 | `MEDIUM_TIMEOUT_MS` | `15000` | Fetch timeout |
 | `MEDIUM_FILE_THRESHOLD_CHARS` | `8000` | File save threshold |
 
-### Media Extraction
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `EXTRACT_ENABLED` | `true` | Enable /extract command |
-| `YTDLP_COOKIES_PATH` | — | Netscape cookies.txt for yt-dlp |
-
-### Voice & TTS
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GROQ_API_KEY` | — | Groq API key for Whisper |
-| `GROQ_TRANSCRIBE_PATH` | — | Path to `groq_transcribe.py` |
-| `OPENAI_API_KEY` | — | OpenAI API key for TTS |
-| `TTS_VOICE` | `coral` | Default TTS voice |
-| `TTS_MODEL` | `gpt-4o-mini-tts` | TTS model |
-| `VOICE_SHOW_TRANSCRIPT` | `true` | Show transcript text before agent response |
-
 ---
 
 ## Architecture
@@ -327,14 +335,13 @@ src/
 │   ├── handlers/
 │   │   ├── command.handler.ts     # All slash commands + inline keyboards
 │   │   ├── message.handler.ts     # Text routing, ForceReply dispatch
-│   │   ├── voice.handler.ts       # Voice download, transcription, agent relay
 │   │   └── photo.handler.ts       # Image save + agent notification
 │   └── middleware/
 │       ├── auth.middleware.ts      # User whitelist + group chat auth
 │       └── stale-filter.ts        # Ignore stale messages on restart
 ├── claude/
 │   ├── agent.ts                   # Claude Agent SDK, session resume, system prompt
-│   ├── mcp-tools.ts              # MCP server: Reddit, Medium, Extract, Telegraph tools
+│   ├── mcp-tools.ts              # MCP server: Reddit, Medium, Telegraph tools
 │   ├── session-manager.ts         # Per-chat session state
 │   ├── session-history.ts         # Session persistence and history
 │   ├── request-queue.ts           # Sequential request queue
@@ -345,8 +352,6 @@ src/
 │   └── vreddit.ts                 # Reddit video download + compression pipeline
 ├── medium/
 │   └── freedium.ts                # Freedium article fetcher
-├── media/
-│   └── extract.ts                 # YouTube/TikTok/Instagram extraction (yt-dlp)
 ├── telegram/
 │   ├── message-sender.ts          # Streaming, chunking, Telegraph routing
 │   ├── markdown.ts                # MarkdownV2 escaping
@@ -355,12 +360,6 @@ src/
 │   ├── terminal-renderer.ts       # Terminal-style UI renderer
 │   ├── terminal-settings.ts       # Per-chat terminal UI toggle
 │   └── deduplication.ts           # Message dedup
-├── tts/
-│   ├── tts.ts                     # TTS provider routing (Groq Orpheus / OpenAI)
-│   ├── tts-settings.ts            # Per-chat voice settings
-│   └── voice-reply.ts             # TTS hook for agent responses
-├── audio/
-│   └── transcribe.ts              # Shared transcription utilities
 ├── utils/
 │   ├── download.ts                # URL download with SSRF protection
 │   ├── sanitize.ts                # Path and error sanitization
@@ -422,7 +421,7 @@ Then `/continue` or `/resume` in Telegram to restore your session.
 
 ## Credits
 
-Original project by [NachoSEO](https://github.com/NachoSEO/claudegram). Extended with Reddit video downloads, voice transcription, TTS, Medium integration, Telegraph output, image uploads, and session continuity.
+Original project by [NachoSEO](https://github.com/NachoSEO/claudegram). Extended with Reddit video downloads, Medium integration, Telegraph output, image uploads, and session continuity.
 
 ## License
 

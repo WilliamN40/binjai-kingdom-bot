@@ -10,19 +10,58 @@ loadEnv({ path: envPath });
 
 const toBool = (val: string) => val.toLowerCase() === 'true';
 
+const toIdList = (val: string) =>
+  val
+    .split(',')
+    .map((id) => parseInt(id.trim(), 10))
+    .filter((id) => Number.isFinite(id));
+
+const toInt = (val: string) => parseInt(val, 10);
+
 const envSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(1, 'Telegram bot token is required'),
-  ALLOWED_USER_IDS: z
-    .string()
-    .min(1, 'At least one allowed user ID is required')
-    .transform((val) => val.split(',').map((id) => parseInt(id.trim(), 10))),
-  ALLOWED_GROUP_IDS: z
-    .string()
-    .default('')
-    .transform((val) => val ? val.split(',').map((id) => parseInt(id.trim(), 10)) : []),
-  ANTHROPIC_API_KEY: z.string().optional(), // Optional - uses Claude Max subscription if not set
-  // OpenAI (TTS)
-  OPENAI_API_KEY: z.string().optional(),
+  // Optional: owners can also be registered at runtime with /claim <code> in a private chat.
+  ALLOWED_USER_IDS: z.string().default('').transform(toIdList),
+  // Optional: groups can also be enabled at runtime by an owner sending /enable in the group.
+  ALLOWED_GROUP_IDS: z.string().default('').transform(toIdList),
+  ANTHROPIC_API_KEY: z.string().optional(), // Optional - uses Claude subscription login if not set
+  // Long-lived subscription token from `claude setup-token` (read by the Claude Code subprocess)
+  CLAUDE_CODE_OAUTH_TOKEN: z.string().optional(),
+  // Default Claude model for private chats and for the group secretary
+  CLAUDE_MODEL: z.string().default('claude-opus-5-5'),
+
+  // If the token is connected to another service's webhook, disconnect it and poll here instead
+  TELEGRAM_TAKE_OVER_WEBHOOK: z.string().default('false').transform(toBool),
+
+  // ── Group secretary ────────────────────────────────────────────
+  // Where transcripts, notes and bot state live
+  DATA_DIR: z.string().default(path.resolve(__dirname, '..', 'data')),
+  // One-time code for `/claim <code>`; generated and logged on first start if unset
+  OWNER_CLAIM_CODE: z.string().optional(),
+  // Model for group answers (empty = CLAUDE_MODEL)
+  SECRETARY_MODEL: z.string().default(''),
+  SECRETARY_EFFORT: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).default('medium'),
+  // Extra house rules for the secretary's replies (tone, words to avoid, language), in plain words
+  SECRETARY_INSTRUCTIONS: z.string().default(''),
+  // Timezone used for transcript timestamps and daily file boundaries
+  SECRETARY_TIMEZONE: z.string().default('Asia/Singapore'),
+  // Let the secretary search the web for questions that are not about the group
+  SECRETARY_WEB_SEARCH: z.string().default('true').transform(toBool),
+  SECRETARY_MAX_TURNS: z.string().default('40').transform(toInt),
+  SECRETARY_TIMEOUT_MS: z.string().default('600000').transform(toInt),
+  // How much recent transcript is placed directly in each prompt (older history is searched on demand)
+  SECRETARY_CONTEXT_CHARS: z.string().default('40000').transform(toInt),
+  SECRETARY_MAX_CONCURRENT: z.string().default('4').transform(toInt),
+  // Attach the photo when someone asks about an image (caption mention or reply to a photo)
+  SECRETARY_VISION: z.string().default('true').transform(toBool),
+  // Unix socket of the sandbox runner. When set, the secretary can run commands and
+  // save files inside the sandbox container. Empty = those tools are not offered.
+  SANDBOX_SOCKET: z.string().default(''),
+  // Reminders and recurring tasks the secretary can set for a group
+  SECRETARY_SCHEDULES: z.string().default('true').transform(toBool),
+  // A recurring schedule may not fire more often than this (minutes)
+  SECRETARY_MIN_REPEAT_MINUTES: z.string().default('15').transform(toInt),
+  SECRETARY_MAX_SCHEDULES_PER_GROUP: z.string().default('100').transform(toInt),
   WORKSPACE_DIR: z.string().default(process.env.HOME || '.'),
   CLAUDE_EXECUTABLE_PATH: z.string().default('claude'),
   CLAUDE_USE_BUNDLED_EXECUTABLE: z
@@ -49,21 +88,6 @@ const envSchema = z.object({
     .string()
     .default('4000')
     .transform((val) => parseInt(val, 10)),
-  // TTS Configuration
-  TTS_ENABLED: z.string().default('true').transform(toBool),
-  TTS_PROVIDER: z.enum(['groq', 'openai']).default('groq'),
-  TTS_MODEL: z.string().default('gpt-4o-mini-tts'),
-  TTS_VOICE: z.string().default('coral'),
-  TTS_INSTRUCTIONS: z.string().default('Speak in a friendly, natural conversational tone.'),
-  TTS_SPEED: z
-    .string()
-    .default('1.0')
-    .transform((val) => parseFloat(val)),
-  TTS_MAX_CHARS: z
-    .string()
-    .default('4096')
-    .transform((val) => parseInt(val, 10)),
-  TTS_RESPONSE_FORMAT: z.string().default('opus'),
   IMAGE_MAX_FILE_SIZE_MB: z
     .string()
     .default('20')
@@ -125,36 +149,6 @@ const envSchema = z.object({
     .string()
     .default('2000')
     .transform((val) => parseInt(val, 10)),
-  // Voice transcription (Groq Whisper)
-  GROQ_API_KEY: z.string().optional(),
-  GROQ_TRANSCRIBE_PATH: z.string().default(''),
-  TRANSCRIBE_ENABLED: z.string().default('true').transform(toBool),
-  VOICE_SHOW_TRANSCRIPT: z
-    .string()
-    .default('true')
-    .transform((val) => val.toLowerCase() === 'true'),
-  VOICE_MAX_FILE_SIZE_MB: z
-    .string()
-    .default('19')
-    .transform((val) => parseInt(val, 10)),
-  VOICE_LANGUAGE: z.string().default('en'),
-  VOICE_TIMEOUT_MS: z
-    .string()
-    .default('60000')
-    .transform((val) => parseInt(val, 10)),
-  // Transcribe command: send .txt file if transcript exceeds this many chars
-  TRANSCRIBE_FILE_THRESHOLD_CHARS: z
-    .string()
-    .default('4000')
-    .transform((val) => parseInt(val, 10)),
-  // Media extraction (/extract command)
-  EXTRACT_ENABLED: z.string().default('true').transform(toBool),
-  YTDLP_COOKIES_PATH: z.string().default(''),
-  YTDLP_PROXY_LIST_PATH: z.string().default(''),
-  EXTRACT_TRANSCRIBE_TIMEOUT_MS: z
-    .string()
-    .default('180000')
-    .transform((val) => parseInt(val, 10)),
   // Context visibility
   CONTEXT_SHOW_USAGE: z
     .string()
@@ -206,16 +200,6 @@ const envSchema = z.object({
   NOTIFICATION_THRESHOLD_SECONDS: z
     .string()
     .default('60')
-    .transform((val) => parseInt(val, 10)),
-  // OpenCode provider integration
-  OPENCODE_ENABLED: z
-    .string()
-    .default('false')
-    .transform((val) => val.toLowerCase() === 'true'),
-  OPENCODE_BASE_URL: z.string().optional(),
-  OPENCODE_PORT: z
-    .string()
-    .default('4096')
     .transform((val) => parseInt(val, 10)),
 });
 

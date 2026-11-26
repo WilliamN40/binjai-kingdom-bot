@@ -6,7 +6,7 @@ export interface ParsedCommand {
   model: string | null;
 }
 
-const CLAUDE_COMMANDS = ['plan', 'explore', 'model', 'commands', 'loop', 'resume', 'continue', 'sessions', 'provider'] as const;
+const CLAUDE_COMMANDS = ['plan', 'explore', 'model', 'commands', 'loop', 'resume', 'continue', 'sessions'] as const;
 type ClaudeCommand = (typeof CLAUDE_COMMANDS)[number];
 
 export function parseClaudeCommand(message: string): ParsedCommand {
@@ -50,7 +50,6 @@ export function getAvailableCommands(): string {
         '• `/explore <question>` \\- Use explore agent for codebase questions',
         '• `/loop <task>` \\- Run iteratively until task complete',
         '• `/model \\[name\\]` \\- Show or set AI model',
-        ...(config.OPENCODE_ENABLED ? ['• `/provider` \\- Switch AI provider \\(Claude / OpenCode\\)'] : []),
         '• `/commands` \\- Show this list',
       ],
     },
@@ -94,21 +93,9 @@ export function getAvailableCommands(): string {
     });
   }
 
-  const mediaCommands: string[] = [];
-  if (config.EXTRACT_ENABLED) {
-    mediaCommands.push('• `/extract <url>` \\- Extract text/audio/video from YouTube, Instagram, TikTok');
-  }
-  if (config.TRANSCRIBE_ENABLED) {
-    mediaCommands.push('• `/transcribe` \\- Transcribe audio to text \\(reply to voice/audio, or ForceReply\\)');
-  }
-  if (mediaCommands.length > 0) {
-    sections.push({ title: 'Media Commands', commands: mediaCommands });
-  }
-
   sections.push({
     title: 'Bot Commands',
     commands: [
-      '• `/tts` \\- Toggle voice replies',
       '• `/context` \\- Show Claude context usage',
       '• `/botstatus` \\- Show bot process status',
       '• `/restartbot` \\- Restart the bot process',

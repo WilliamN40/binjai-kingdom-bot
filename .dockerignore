@@ -1,0 +1,14 @@
+node_modules
+dist
+data
+.env
+.env.*
+!.env.example
+.git
+.claude
+.claudegram
+docs
+test
+scripts
+*.md
+*.log

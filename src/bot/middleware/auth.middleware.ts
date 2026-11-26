@@ -1,5 +1,5 @@
 import { Context, NextFunction } from 'grammy';
-import { config } from '../../config.js';
+import { isOwner } from '../../secretary/state.js';
 
 /**
  * Log authentication attempt for security auditing.
@@ -18,9 +18,14 @@ function logAuthAttempt(
   console.log(`[auth] ${timestamp} ${status} ${userInfo} ${usernameInfo} chat:${chatType || 'unknown'}`);
 }
 
-// Telegram's GroupAnonymousBot ID — used when admins post anonymously in groups/forums
-const GROUP_ANONYMOUS_BOT_ID = 1087968824;
+// Strangers get one "not authorized" reply per hour, not one per message.
+const DENIAL_NOTICE_INTERVAL_MS = 60 * 60 * 1000;
+const lastDenialNotice = new Map<number, number>();
 
+/**
+ * Gate for the private-chat assistant (full Claude Code access): owners only.
+ * Group traffic never gets here; the secretary middleware handles it earlier.
+ */
 export async function authMiddleware(
   ctx: Context,
   next: NextFunction
@@ -28,23 +33,21 @@ export async function authMiddleware(
   const userId = ctx.from?.id;
   const username = ctx.from?.username;
   const chatType = ctx.chat?.type;
-  const chatId = ctx.chat?.id;
 
-  if (!userId) {
-    logAuthAttempt(false, undefined, undefined, chatType);
+  if (chatType !== 'private') {
     return;
   }
 
-  // Allow anonymous admins in explicitly allowed groups (forum topics)
-  if (userId === GROUP_ANONYMOUS_BOT_ID && chatId && config.ALLOWED_GROUP_IDS.includes(chatId)) {
-    logAuthAttempt(true, userId, username, chatType);
-    await next();
-    return;
-  }
-
-  if (!config.ALLOWED_USER_IDS.includes(userId)) {
+  if (!userId || !isOwner(userId)) {
     logAuthAttempt(false, userId, username, chatType);
-    await ctx.reply('⛔ You are not authorized to use this bot.');
+    if (userId) {
+      const now = Date.now();
+      if (now - (lastDenialNotice.get(userId) ?? 0) > DENIAL_NOTICE_INTERVAL_MS) {
+        if (lastDenialNotice.size > 5000) lastDenialNotice.clear();
+        lastDenialNotice.set(userId, now);
+        await ctx.reply('⛔ This is a private bot. In a group where I work as secretary, mention me there instead.');
+      }
+    }
     return;
   }
 

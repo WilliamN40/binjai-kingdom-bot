@@ -5,6 +5,7 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import { config } from '../config.js';
 import { buildSessionKey } from '../utils/session-key.js';
 import { authMiddleware } from './middleware/auth.middleware.js';
+import { secretaryMiddleware, GROUP_COMMANDS } from '../secretary/group.js';
 import {
   handleStart,
   handleClear,
@@ -15,8 +16,6 @@ import {
   handleStatus,
   handleMode,
   handleModeCallback,
-  handleTTS,
-  handleTTSCallback,
   handleTelegraph,
   handleTelegraphCallback,
   handleBotStatus,
@@ -28,8 +27,6 @@ import {
   handleCommands,
   handleModelCommand,
   handleModelCallback,
-  handleProviderCommand,
-  handleProviderCallback,
   handlePlan,
   handleExplore,
   handleResume,
@@ -45,17 +42,11 @@ import {
   handleMediumCallback,
   handleTerminalUI,
   handleTerminalUICallback,
-  handleTranscribe,
-  handleTranscribeAudio,
-  handleTranscribeDocument,
-  handleExtract,
-  handleExtractCallback,
   handleRedditActionCallback,
   handleReset,
   handleResetCallback,
 } from './handlers/command.handler.js';
 import { handleMessage } from './handlers/message.handler.js';
-import { handleVoice } from './handlers/voice.handler.js';
 import { handlePhoto, handleImageDocument } from './handlers/photo.handler.js';
 
 // Resolve sequentialize constraint: same-chat updates are ordered,
@@ -124,26 +115,33 @@ export async function createBot(): Promise<Bot> {
     ...(config.REDDIT_ENABLED ? [{ command: 'reddit', description: '📡 Fetch Reddit posts & subreddits' }] : []),
     ...(config.VREDDIT_ENABLED ? [{ command: 'vreddit', description: '🎬 Download Reddit video from post URL' }] : []),
     ...(config.MEDIUM_ENABLED ? [{ command: 'medium', description: '📰 Fetch Medium articles' }] : []),
-    ...(config.TRANSCRIBE_ENABLED ? [{ command: 'transcribe', description: '🎤 Transcribe audio to text' }] : []),
-    ...(config.EXTRACT_ENABLED ? [{ command: 'extract', description: '📥 Extract text/audio/video from URL' }] : []),
     { command: 'file', description: '📎 Download a file from project' },
     { command: 'telegraph', description: '📄 View markdown with Instant View' },
     { command: 'model', description: '🤖 Switch AI model' },
-    ...(config.OPENCODE_ENABLED ? [{ command: 'provider', description: '🔌 Switch AI provider' }] : []),
     { command: 'mode', description: '⚙️ Toggle streaming mode' },
     { command: 'terminalui', description: '🖥️ Toggle terminal-style display' },
-    { command: 'tts', description: '🔊 Toggle voice replies' },
     { command: 'ping', description: '🏓 Check if bot is responsive' },
     { command: 'commands', description: '📜 List all commands' },
+    { command: 'groups', description: '📒 Groups the secretary is recording' },
   ];
 
-  bot.api.setMyCommands(commandList).then(() => {
-    console.log('📋 Command menu registered');
+  // Private chats get the full assistant menu, groups get the secretary menu.
+  // The unscoped default list is cleared so nothing left by a previous bot setup shows up.
+  Promise.all([
+    bot.api.deleteMyCommands(),
+    bot.api.setMyCommands(commandList, { scope: { type: 'all_private_chats' } }),
+    bot.api.setMyCommands(GROUP_COMMANDS, { scope: { type: 'all_group_chats' } }),
+  ]).then(() => {
+    console.log('📋 Command menus registered');
   }).catch((err) => {
     console.warn('⚠️ Failed to register commands:', err.message);
   });
 
-  // Apply auth middleware to all updates
+  // Group secretary: records enabled groups and answers questions there.
+  // It consumes every group update, so everything below only ever sees private chats.
+  bot.use(secretaryMiddleware);
+
+  // Apply auth middleware to all (private-chat) updates
   bot.use(authMiddleware);
 
   // /cancel, /reset, and /ping fire BEFORE sequentialize so they bypass per-chat ordering.
@@ -164,16 +162,12 @@ export async function createBot(): Promise<Bot> {
   bot.command('status', handleStatus);
   bot.command('mode', handleMode);
   bot.command('terminalui', handleTerminalUI);
-  bot.command('tts', handleTTS);
   bot.command('botstatus', handleBotStatus);
   bot.command('restartbot', handleRestartBot);
   bot.command('context', handleContext);
 
   bot.command('commands', handleCommands);
   bot.command('model', handleModelCommand);
-  if (config.OPENCODE_ENABLED) {
-    bot.command('provider', handleProviderCommand);
-  }
   bot.command('plan', handlePlan);
   bot.command('explore', handleExplore);
 
@@ -203,32 +197,18 @@ export async function createBot(): Promise<Bot> {
     bot.command('medium', handleMedium);
   }
 
-  // Transcribe
-  if (config.TRANSCRIBE_ENABLED) {
-    bot.command('transcribe', handleTranscribe);
-  }
-
-  // Media extraction
-  if (config.EXTRACT_ENABLED) {
-    bot.command('extract', handleExtract);
-  }
-
   // Callback query handler for inline keyboards
   bot.on('callback_query:data', async (ctx) => {
     const data = ctx.callbackQuery.data;
 
     if (data.startsWith('resume:')) {
       await handleResumeCallback(ctx);
-    } else if (data.startsWith('provider:')) {
-      await handleProviderCallback(ctx);
     } else if (data.startsWith('model:')) {
       await handleModelCallback(ctx);
     } else if (data.startsWith('mode:')) {
       await handleModeCallback(ctx);
     } else if (data.startsWith('terminalui:')) {
       await handleTerminalUICallback(ctx);
-    } else if (data.startsWith('tts:')) {
-      await handleTTSCallback(ctx);
     } else if (data.startsWith('telegraph:')) {
       await handleTelegraphCallback(ctx);
     } else if (data.startsWith('clear:')) {
@@ -237,8 +217,6 @@ export async function createBot(): Promise<Bot> {
       await handleProjectCallback(ctx);
     } else if (data.startsWith('medium:')) {
       await handleMediumCallback(ctx);
-    } else if (data.startsWith('extract:')) {
-      await handleExtractCallback(ctx);
     } else if (data.startsWith('reddit_action:')) {
       await handleRedditActionCallback(ctx);
     } else if (data.startsWith('restart:')) {
@@ -248,30 +226,11 @@ export async function createBot(): Promise<Bot> {
     }
   });
 
-  // Handle voice messages
-  bot.on('message:voice', handleVoice);
-
-  // Handle audio messages (music/audio files - separate from voice notes)
-  bot.on('message:audio', handleTranscribeAudio);
-
   // Handle images
   bot.on('message:photo', handlePhoto);
 
-  // Handle documents: check for audio transcribe ForceReply first, then image documents
-  bot.on('message:document', async (ctx) => {
-    // Try transcribe-document path first (audio MIME + reply to ForceReply)
-    const replyTo = ctx.message?.reply_to_message;
-    const doc = ctx.message?.document;
-    if (replyTo && replyTo.from?.is_bot && doc?.mime_type?.startsWith('audio/')) {
-      const replyText = (replyTo as { text?: string }).text || '';
-      if (replyText.includes('Transcribe Audio')) {
-        await handleTranscribeDocument(ctx);
-        return;
-      }
-    }
-    // Fall through to image document handler
-    await handleImageDocument(ctx);
-  });
+  // Handle image documents
+  bot.on('message:document', handleImageDocument);
 
   // Handle regular text messages
   bot.on('message:text', handleMessage);

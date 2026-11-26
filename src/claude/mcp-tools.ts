@@ -1,14 +1,14 @@
 /**
  * MCP Tools — In-process MCP server factory for Claudegram.
  *
- * Wraps existing standalone functions (reddit, medium, extract, telegraph,
+ * Wraps existing standalone functions (reddit, medium, telegraph,
  * project management) as MCP tools so Claude can invoke them automatically
  * based on conversation context instead of requiring explicit /commands.
  */
 
 import { z } from 'zod';
 import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
-import { InputFile, type Context } from 'grammy';
+import { type Context } from 'grammy';
 import * as fs from 'fs';
 import * as path from 'path';
 import { config } from '../config.js';
@@ -22,10 +22,6 @@ async function importReddit() {
 
 async function importMedium() {
   return import('../medium/freedium.js');
-}
-
-async function importExtract() {
-  return import('../media/extract.js');
 }
 
 async function importTelegraph() {
@@ -70,10 +66,6 @@ function buildToolList(toolsCtx: McpToolsContext) {
 
   if (config.MEDIUM_ENABLED) {
     tools.push(fetchMediumTool(toolsCtx));
-  }
-
-  if (config.EXTRACT_ENABLED) {
-    tools.push(extractMediaTool(toolsCtx));
   }
 
   if (config.TELEGRAPH_ENABLED) {
@@ -226,76 +218,6 @@ function fetchMediumTool(_toolsCtx: McpToolsContext) {
           content: [{ type: 'text' as const, text: `Medium fetch error: ${error instanceof Error ? error.message : String(error)}` }],
           isError: true,
         };
-      }
-    }
-  );
-}
-
-function extractMediaTool(toolsCtx: McpToolsContext) {
-  return tool(
-    'claudegram_extract_media',
-    'Extract text transcripts, audio, or video from YouTube, Instagram, and TikTok URLs. Audio/video files are sent directly to the user via Telegram. Transcripts are returned as text.',
-    {
-      url: z.string().describe('URL of the video (YouTube, Instagram, or TikTok)'),
-      mode: z.enum(['text', 'audio', 'video', 'all']).describe('What to extract: "text" for transcript, "audio" for MP3, "video" for MP4, "all" for everything'),
-    },
-    async ({ url, mode }) => {
-      const { extractMedia, cleanupExtractResult } = await importExtract();
-      let result: Awaited<ReturnType<typeof extractMedia>> | undefined;
-
-      try {
-        result = await extractMedia({ url, mode });
-
-        const ctx = toolsCtx.telegramCtx;
-        const parts: string[] = [];
-
-        // Send media files to user via Telegram
-        if (result.videoPath) {
-          try {
-            await ctx.replyWithVideo(new InputFile(result.videoPath), {
-              caption: `📹 ${result.title}`,
-            });
-            parts.push('Video sent to user.');
-          } catch (err) {
-            parts.push(`Video send failed: ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
-
-        if (result.audioPath && (mode === 'audio' || mode === 'all')) {
-          try {
-            await ctx.replyWithAudio(new InputFile(result.audioPath), {
-              caption: `🎵 ${result.title}`,
-            });
-            parts.push('Audio sent to user.');
-          } catch (err) {
-            parts.push(`Audio send failed: ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
-
-        if (result.transcript) {
-          parts.push(`Transcript:\n\n${result.transcript}`);
-        }
-
-        if (result.warnings.length > 0) {
-          parts.push(`Warnings: ${result.warnings.join('; ')}`);
-        }
-
-        if (parts.length === 0) {
-          parts.push('Extraction completed but no content was produced.');
-        }
-
-        return {
-          content: [{ type: 'text' as const, text: parts.join('\n\n') }],
-        };
-      } catch (error) {
-        return {
-          content: [{ type: 'text' as const, text: `Media extraction error: ${error instanceof Error ? error.message : String(error)}` }],
-          isError: true,
-        };
-      } finally {
-        if (result) {
-          cleanupExtractResult(result);
-        }
       }
     }
   );

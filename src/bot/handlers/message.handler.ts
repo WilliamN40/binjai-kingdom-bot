@@ -16,10 +16,8 @@ import {
 import { isClaudeCommand } from '../../claude/command-parser.js';
 import { escapeMarkdownV2 as esc } from '../../telegram/markdown.js';
 import { createTelegraphFromFile } from '../../telegram/telegraph.js';
-import { getStreamingMode, executeRedditFetch, executeMediumFetch, showExtractMenu, projectStatusSuffix, resumeCommandMessage } from './command.handler.js';
+import { getStreamingMode, executeRedditFetch, executeMediumFetch, projectStatusSuffix, resumeCommandMessage } from './command.handler.js';
 import { executeVReddit } from '../../reddit/vreddit.js';
-import { detectPlatform, isValidUrl } from '../../media/extract.js';
-import { maybeSendVoiceReply } from '../../tts/voice-reply.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getWorkspaceRoot, isPathWithinRoot } from '../../utils/workspace-guard.js';
@@ -229,28 +227,11 @@ export async function handleMessage(ctx: Context): Promise<void> {
       await executeMediumFetch(ctx, text.trim());
       return;
     }
-
-    // Handle extract media reply
-    if (replyText.includes('Extract Media') || replyText.includes('Paste a URL')) {
-      if (!config.EXTRACT_ENABLED) {
-        await replyFeatureDisabled(ctx, 'Extract');
-        return;
-      }
-      await showExtractMenu(ctx, text.trim());
-      return;
-    }
   }
 
   const vRedditUrl = getAutoVRedditUrl(text);
   if (vRedditUrl) {
     await executeVReddit(ctx, vRedditUrl);
-    return;
-  }
-
-  // Auto-detect YouTube / TikTok / Instagram URLs sent as bare links → show extract menu
-  const trimmedText = text.trim();
-  if (config.EXTRACT_ENABLED && isValidUrl(trimmedText) && detectPlatform(trimmedText) !== 'unknown') {
-    await showExtractMenu(ctx, trimmedText);
     return;
   }
 
@@ -468,7 +449,6 @@ async function handleAgentReply(
         }
 
         await messageSender.finishStreaming(ctx, response.text);
-        await maybeSendVoiceReply(ctx, response.text);
 
         // Completion notification for long tasks
         await messageSender.sendCompletionNotification(ctx, Date.now() - startTime);
@@ -584,7 +564,6 @@ async function handleStreamingResponse(
     });
 
     await messageSender.finishStreaming(ctx, response.text);
-    await maybeSendVoiceReply(ctx, response.text);
 
     // Completion notification for long tasks (streaming edits don't trigger push notifications)
     await messageSender.sendCompletionNotification(ctx, Date.now() - startTime);
@@ -617,7 +596,6 @@ async function handleWaitResponse(
     messageSender.stopTypingInterval(typingInterval);
 
     await messageSender.sendMessage(ctx, response.text);
-    await maybeSendVoiceReply(ctx, response.text);
 
     // Context visibility notifications
     await sendUsageFooter(ctx, response.usage);
