@@ -29,6 +29,7 @@ import {
 } from './hooks.js';
 import { forgetMcpServers } from './mcp.js';
 import { callTelegram, methodLevel, prepareCall, sentMessages } from './telegram-api.js';
+import { describeResult, describeVote, findPoll, rememberPoll } from './polls.js';
 import { confirmDeploy, currentVersion, deployEnabled, describePlan, planDeploy, takeDeployResult } from './deploy.js';
 import { clearSandbox, readSandboxFile, runInSandbox, sandboxEnabled, sandboxMachineAction, uploadToSandbox } from './sandbox.js';
 import { formatUsage, logUsage } from './usage.js';
@@ -466,9 +467,6 @@ function imageViewer(api: Api, chatId: number) {
   };
 }
 
-/** Polls the bot sent, by poll id, so a vote (which names no chat) can be routed to the group's hooks. */
-const pollChats = new Map<string, { chatId: number; topic?: string }>();
-
 /**
  * Calls any Telegram Bot API method for one group (rights are checked by the caller), writes what it
  * sent to the record, and remembers polls so their votes reach the hooks.
@@ -478,12 +476,26 @@ function telegramCaller(api: Api, me: BotFullInfo, chatId: number, threadId: num
     const payload = await prepareCall(method, params, { chatId, threadId }, (file) => readSandboxFile(chatId, sandboxUidFor(chatId), file));
     const result = await callTelegram(api, method, payload);
     for (const sent of sentMessages(result)) {
-      const poll = (sent as { poll?: { id: string; question: string } }).poll;
+      const poll = (sent as { poll?: { id: string; question: string; options: Array<{ text: string }>; is_anonymous: boolean } }).poll;
       if (poll) {
-        if (pollChats.size > 1000) pollChats.clear();
-        pollChats.set(poll.id, { chatId, topic });
+        // Votes arrive naming only the poll, so remember where it is and what it asked.
+        rememberPoll(poll.id, {
+          chatId,
+          topic,
+          threadId,
+          messageId: sent.message_id,
+          question: poll.question,
+          options: poll.options.map((o) => o.text),
+          anonymous: poll.is_anonymous,
+          at: new Date().toISOString(),
+        });
       }
-      const body = sent.text ?? sent.caption ?? (poll ? `[poll] ${poll.question}` : `[${method.replace(/^send/, '').toLowerCase() || method}]`);
+      const body =
+        sent.text ??
+        sent.caption ??
+        (poll
+          ? `[poll${poll.is_anonymous ? ', anonymous' : ''}] ${poll.question} (options: ${poll.options.map((o) => o.text).join(' / ')})`
+          : `[${method.replace(/^send/, '').toLowerCase() || method}]`);
       if (sent.chat?.id === chatId && method !== 'forwardMessage') recordBotMessage(me, sent as unknown as Message, body, `${label} via ${method}`, topic);
     }
     console.log(`[Telegram] ${chatId} ${label}: ${method}`);
@@ -670,6 +682,8 @@ async function answer(
           viewImage: imageViewer(api, chatId),
           fetchFile: sandboxEnabled() ? fileFetcher(api, group) : undefined,
           telegramCall: telegramCaller(api, me, chatId, target.threadId, answerTopic, `asked by ${senderOf(msg).name}`),
+          // A hook-originated run may not start jobs either.
+          startJob: ask.viaHook ? undefined : jobStarter(api, me, group, msg, target, answerTopic),
         },
         entry.controller,
       ),
@@ -729,6 +743,119 @@ async function answer(
         console.warn(`[Secretary] Could not clear the reaction on msg ${msg.message_id} in ${chatId}:`, (error as Error).message);
       }
     });
+  }
+}
+
+// ── Background jobs ──────────────────────────────────────────────────
+
+const JOB_TIMEOUT_MS = 60 * 60_000;
+const JOB_MAX_TURNS = 400;
+const MAX_JOBS_PER_GROUP = 3;
+const jobsByGroup = new Map<number, Set<string>>();
+
+function jobsDir(): string {
+  return path.join(config.DATA_DIR, 'jobs');
+}
+
+/**
+ * Lets the secretary hand long work to a background run of itself: up to an hour and many more
+ * steps, not holding an answer slot, posting its result as a reply to the request. /stop cancels
+ * it like an answer. A file per job marks it as running, so one cut off by a restart is reported.
+ */
+function jobStarter(api: Api, me: BotFullInfo, group: GroupState, msg: Message, target: Target, topic: string | undefined) {
+  const asker = senderLabel(senderOf(msg));
+  return (instruction: string, title: string, effort?: EffortLevel): string => {
+    const chatId = group.chatId;
+    const active = jobsByGroup.get(chatId) ?? new Set<string>();
+    jobsByGroup.set(chatId, active);
+    if (active.size >= MAX_JOBS_PER_GROUP) {
+      throw new Error(`This group already has ${MAX_JOBS_PER_GROUP} background jobs running. Wait for one to finish, or /stop.`);
+    }
+    const id = Math.random().toString(16).slice(2, 6);
+    active.add(id);
+    const replyTarget: Target = { chatId, threadId: target.threadId, replyTo: msg.message_id };
+    const file = path.join(jobsDir(), `${id}.json`);
+    fs.mkdirSync(jobsDir(), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ id, chatId, threadId: target.threadId, replyTo: msg.message_id, title, startedBy: asker, startedAt: new Date().toISOString() }));
+
+    const entry: RunningAnswer = { userId: msg.from?.id ?? 0, controller: new AbortController() };
+    const runningHere = running.get(chatId) ?? new Set<RunningAnswer>();
+    running.set(chatId, runningHere);
+    runningHere.add(entry);
+    console.log(`[Jobs] ${chatId}: started ${id} "${title}" for ${asker}`);
+
+    void (async () => {
+      try {
+        const result = await askSecretary(
+          {
+            group,
+            botName: config.BOT_NAME,
+            asker,
+            askerId: msg.from?.id,
+            question: instruction,
+            topic,
+            threadId: target.threadId,
+            background: true,
+            effort,
+            timeoutMs: JOB_TIMEOUT_MS,
+            maxTurns: JOB_MAX_TURNS,
+            sendFile: fileSender(api, me, replyTarget, topic),
+            viewImage: imageViewer(api, chatId),
+            fetchFile: sandboxEnabled() ? fileFetcher(api, group) : undefined,
+            telegramCall: telegramCaller(api, me, chatId, target.threadId, topic, `job ${id}`),
+          },
+          entry.controller,
+        );
+        if (result.text) {
+          const text = `🧰 ${title}\n${result.text}`;
+          const sent = await sendFormatted(api, replyTarget, text);
+          if (sent) recordBotMessage(me, sent, text, `background job ${id} for ${senderOf(msg).name}`, topic);
+        }
+        logUsage(chatId, {
+          t: new Date().toISOString(),
+          kind: 'job',
+          userId: msg.from?.id,
+          name: senderOf(msg).name,
+          costUsd: result.costUsd ?? 0,
+          seconds: Math.round(result.durationMs / 1000),
+          turns: result.turns ?? 0,
+        });
+        console.log(`[Jobs] ${chatId}: ${id} done (${Math.round(result.durationMs / 1000)}s, ${result.turns ?? '?'} turns)`);
+      } catch (error) {
+        const reason = (error as Error).message;
+        const stopped = entry.controller.signal.aborted && !/too long/.test(reason);
+        console.warn(`[Jobs] ${chatId}: ${id} ${stopped ? 'stopped' : `failed: ${reason}`}`);
+        const text = stopped ? `🧰 ${title}: stopped.` : `⚠️ The background job "${title}" did not finish: ${reason.slice(0, 300)}`;
+        await sendPlain(api, replyTarget, text).catch(() => {});
+      } finally {
+        active.delete(id);
+        runningHere.delete(entry);
+        fs.rmSync(file, { force: true });
+      }
+    })();
+    return id;
+  };
+}
+
+/** Jobs still marked as running at startup were cut off by a restart: say so where they were asked. */
+export function reportInterruptedJobs(api: Api): void {
+  let files: string[];
+  try {
+    files = fs.readdirSync(jobsDir()).filter((name) => name.endsWith('.json'));
+  } catch {
+    return;
+  }
+  for (const name of files) {
+    const file = path.join(jobsDir(), name);
+    try {
+      const job = JSON.parse(fs.readFileSync(file, 'utf8')) as { chatId: number; threadId?: number; replyTo?: number; title: string };
+      if (isGroupEnabled(job.chatId)) {
+        void sendPlain(api, { chatId: job.chatId, threadId: job.threadId, replyTo: job.replyTo }, `⚠️ The background job "${job.title}" was cut off by a restart of the bot. Ask again to run it.`).catch(() => {});
+      }
+    } catch {
+      // unreadable: just drop it
+    }
+    fs.rmSync(file, { force: true });
   }
 }
 
@@ -1017,7 +1144,22 @@ function dispatchHooks(api: Api, me: BotFullInfo, group: GroupState, msg: Messag
 
 /** Builds the function the scheduler calls for each reminder or task that comes due. */
 export function createScheduleDeliverer(api: Api, me: BotFullInfo) {
+  // A fast-repeating schedule whose last run is still going is skipped, not stacked up.
+  const busy = new Set<string>();
   return async (chatId: number, schedule: Schedule): Promise<void> => {
+    const key = `${chatId}:${schedule.id}`;
+    if (busy.has(key)) return;
+    busy.add(key);
+    try {
+      await deliverSchedule(api, me, chatId, schedule);
+    } finally {
+      busy.delete(key);
+    }
+  };
+}
+
+async function deliverSchedule(api: Api, me: BotFullInfo, chatId: number, schedule: Schedule): Promise<void> {
+  {
     const group = getGroup(chatId);
     if (!group?.enabled) return;
 
@@ -1797,10 +1939,32 @@ async function handleGroupEvent(ctx: Context): Promise<boolean> {
       raw: reaction,
     };
   } else if (ctx.pollAnswer) {
-    const poll = pollChats.get(ctx.pollAnswer.poll_id);
-    if (!poll) return true; // not one of ours, or from before a restart
+    const poll = findPoll(ctx.pollAnswer.poll_id);
+    if (!poll) return true; // not one of the bot's polls
     chatId = poll.chatId;
-    event = { event: 'poll_answer', poll_id: ctx.pollAnswer.poll_id, option_ids: ctx.pollAnswer.option_ids, from: person(ctx.pollAnswer.user), raw: ctx.pollAnswer };
+    // Every vote goes into the record, so the secretary can say who voted for what.
+    const voter = ctx.pollAnswer.user
+      ? senderLabel({ id: ctx.pollAnswer.user.id, name: person(ctx.pollAnswer.user)!.name, username: ctx.pollAnswer.user.username })
+      : (ctx.pollAnswer.voter_chat?.title ?? 'Someone');
+    if (isGroupEnabled(chatId)) appendTranscript(chatId, new Date(), describeVote(poll, voter, ctx.pollAnswer.option_ids), poll.topic);
+    event = {
+      event: 'poll_answer',
+      poll_id: ctx.pollAnswer.poll_id,
+      poll_message_id: poll.messageId,
+      question: poll.question,
+      option_ids: ctx.pollAnswer.option_ids,
+      options: ctx.pollAnswer.option_ids.map((i) => poll.options[i]),
+      from: person(ctx.pollAnswer.user),
+      raw: ctx.pollAnswer,
+    };
+    threadId = poll.threadId;
+  } else if (ctx.poll) {
+    // State of one of the bot's polls; only its final result is worth recording.
+    const poll = findPoll(ctx.poll.id);
+    if (poll && ctx.poll.is_closed && isGroupEnabled(poll.chatId)) {
+      appendTranscript(poll.chatId, new Date(), describeResult(poll, ctx.poll.options, ctx.poll.total_voter_count), poll.topic);
+    }
+    return true;
   } else {
     return false;
   }

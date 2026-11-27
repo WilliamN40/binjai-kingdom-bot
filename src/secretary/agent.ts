@@ -46,7 +46,7 @@ import {
   sandboxEnabled,
   writeSandboxFile,
 } from './sandbox.js';
-import { cancelSchedule, createSchedule, describeSchedule, listSchedules } from './schedule.js';
+import { cancelSchedule, createSchedule, describeSchedule, listSchedules, repeatLimits } from './schedule.js';
 import { listSecrets } from './secrets.js';
 import { methodLevel } from './telegram-api.js';
 import {
@@ -61,6 +61,7 @@ import {
 import { HOOK_EVENTS, describeHook, listHooks, removeHook, saveHook, setHookEnabled } from './hooks.js';
 import {
   appendNote,
+  editNote,
   ensureGroupDir,
   findTopicId,
   getTopicName,
@@ -68,8 +69,10 @@ import {
   listTopicNames,
   memberName,
   localTime,
+  listNotes,
   readNotes,
   readRecentDigests,
+  removeNotes,
   recentContext,
   transcriptStats,
 } from './transcript.js';
@@ -98,6 +101,13 @@ export interface AskParams {
   viewImage?: (messageId: number) => Promise<ImageAttachment | undefined>;
   /** Saves a file or picture posted earlier in the group into the workspace; returns its path there. */
   fetchFile?: (messageId: number) => Promise<string>;
+  /** Starts a background job (a longer secretary run that posts when done); returns its id. */
+  startJob?: (instruction: string, title: string, effort?: EffortLevel) => string;
+  /** True for a background job's own run. */
+  background?: boolean;
+  /** Overrides for longer runs (background jobs). */
+  timeoutMs?: number;
+  maxTurns?: number;
   /** Calls any Telegram Bot API method for this group (chat forced to it); rights are checked by the tool. */
   telegramCall?: (method: string, params: Record<string, unknown>) => Promise<unknown>;
   /** True when a schedule started this run and nobody is waiting on the other end. */
@@ -189,7 +199,7 @@ Most questions are answered faster straight from the record. Use the workspace w
 
 ## Reminders and recurring tasks
 
-schedule_create sets up something for later. Kind "message" posts the text exactly as written when the time comes. Kind "task" runs you again at that time with the text as your instruction and posts your answer, which suits things like "post a recap of the past week"; a task can carry its own effort level when someone asks for a lighter or deeper run than usual.${sandboxEnabled() ? ` Kind "script" runs a script from the workspace (give its path as the text) without involving you and posts whatever it prints, or nothing if it prints nothing. Instead of text it may print {"actions": [...]} in the hook format below, to delete or pin earlier messages by message_id, post photos or save notes (for example an hourly clean-up of messages a hook queued). It uses no Claude, so prefer it for routine checks, and it may repeat as often as every ${config.SECRETARY_MIN_SCRIPT_REPEAT_MINUTES} minutes.` : ''} Use "at" for one local date and time, or "cron" (five fields, timezone ${tz}) to repeat; work the date out from the current time given with the question. Write the text so it makes sense on its own when it fires, since the conversation around it will be gone. The group's schedules are listed with each question, and schedule_cancel removes one by its id. After scheduling, confirm what will happen and when.`
+schedule_create sets up something for later. Kind "message" posts the text exactly as written when the time comes. Kind "task" runs you again at that time with the text as your instruction and posts your answer, which suits things like "post a recap of the past week"; a task can carry its own effort level when someone asks for a lighter or deeper run than usual.${sandboxEnabled() ? ` Kind "script" runs a script from the workspace (give its path as the text) without involving you and posts whatever it prints, or nothing if it prints nothing. Instead of text it may print {"actions": [...]} in the hook format below, to delete or pin earlier messages by message_id, post photos or save notes (for example an hourly clean-up of messages a hook queued). It uses no Claude, so prefer it for routine checks,.` : ''} Use "at" for one local date and time, "cron" (five fields, timezone ${tz}) to repeat at set times, or "every_seconds" to repeat every N seconds (e.g. a ping every 30 seconds); "until" ends a repeating one at a local time. The shortest allowed gaps are in <settings> and the owner or a manager can change them; work the date out from the current time given with the question. Write the text so it makes sense on its own when it fires, since the conversation around it will be gone. The group's schedules are listed with each question, and schedule_cancel removes one by its id. After scheduling, confirm what will happen and when.`
     : '';
 
   const house = config.SECRETARY_INSTRUCTIONS.trim()
@@ -248,6 +258,7 @@ You can give yourself new tools by connecting an MCP server, without anyone touc
 ## Everything Telegram can do
 
 Your answer is posted as a text message, but the telegram tool reaches every Bot API method in this group, so use the right form when it fits: a poll or quiz to decide something, inline buttons, dice, a sticker, a location or venue, an album of photos, a reaction instead of a reply, editing a message you sent earlier, pinning, opening a topic. The Bot API documentation (core.telegram.org/bots/api) has every method and parameter; check it when unsure. When you already posted with the tool, keep your final answer short or say nothing new (an empty final answer is not posted twice).
+Votes in your polls are written to the record as they come in ("* Alice voted for ... in the poll ..."), and the result when the poll closes, so you can always say who voted for what. Telegram only tells bots who voted in polls the bot posted itself and that are not anonymous, so post polls with "is_anonymous": false unless someone asks for an anonymous one. For a poll a member posted, you only see what people say about it.
 Hooks and scripts can call the same methods with {"do":"api","method":"...","params":{...}} (everyday methods only). Button presses, reactions and votes in polls you sent reach the hooks that ask for them (hook_save events) as events "callback" (data, message_id, from, callback_query_id), "reaction" (message_id, from, added, removed) and "poll_answer" (poll_id, option_ids, from), so you can build menus, reaction triggers and votes that act on their own. Without a hook, a button press is only acknowledged.`;
 
   const cannot = config.SECRETARY_SCHEDULES
@@ -290,7 +301,7 @@ How you behave in this group is set in its settings, which the group_settings to
 
 ## Remembering
 
-When someone asks you to remember, note down or keep track of something (a decision, a deadline, a task, a preference), save it with the save_note tool and confirm in a few words. Your notes are shown to you with every question.${telegramSection}${sandbox}${schedules}${hooks}${mcp}${ownCode}${house}${groupRules}
+When someone asks you to remember, note down or keep track of something (a decision, a deadline, a task, a preference), save it with the save_note tool and confirm in a few words. Your notes are shown to you with every question, numbered. When a note is outdated or contradicted (a preference changed, a plan was cancelled, someone asks to forget it), fix it with note_edit or note_remove instead of adding a contradicting note.${telegramSection}${sandbox}${schedules}${hooks}${mcp}${ownCode}${house}${groupRules}
 
 ## Limits
 
@@ -311,10 +322,16 @@ export function describeSettings(group: GroupState): string {
     `Model: ${group.model ?? `default (${config.SECRETARY_MODEL || config.CLAUDE_MODEL})`}`,
     `Effort: ${group.effort ?? `default (${config.SECRETARY_EFFORT})`}`,
     `House rules: ${group.houseRules?.trim() ? group.houseRules.trim() : 'none'}`,
+    `Repeats: reminders and scripts at most every ${repeatLimits(group.chatId).seconds} s, tasks at most every ${repeatLimits(group.chatId).taskMinutes} min`,
     `Owner: ${owners.join(', ') || 'none'}; managers: ${managers.join(', ') || 'none'} (they can change these settings)`,
     `Secrets (environment variables in the workspace): ${listSecrets(group.chatId).map((s) => s.name).join(', ') || 'none'}`,
     `MCP servers: ${listMcpServers(group.chatId).map(describeMcpServer).join('; ') || 'none'}`,
   ].join('\n');
+}
+
+function role(params: AskParams): string {
+  if (isOwner(params.askerId)) return " (the bot's owner)";
+  return canManage(params.group, params.askerId) ? ' (a manager of this group)' : '';
 }
 
 function buildPrompt(params: AskParams): string {
@@ -345,13 +362,16 @@ function buildPrompt(params: AskParams): string {
   const facts = [`Now: ${weekday}, ${localTime(now).stamp} (${config.SECRETARY_TIMEZONE})`];
   if (topics.length) facts.push(`Known topics: ${['General', ...topics].map((t) => `#${t}`).join(', ')}`);
   if (topic) facts.push(`${params.scheduled ? 'Posting in' : 'Asked in'} topic: #${topic}`);
-  if (params.scheduled) {
+  if (params.background) {
+    facts.push(
+      `This is a background job started by ${asker}${role(params)}. Nobody is waiting for a quick reply: take the time the work needs (up to an hour), check your results, and finish with the message to post, which is sent as a reply to the request. For long work, post a short progress update with the telegram tool (sendMessage) now and then.`,
+    );
+  } else if (params.scheduled) {
     facts.push(
       `This is a scheduled task set up by ${asker}. Nobody is waiting to reply, so carry it out and write the message to post in the group.`,
     );
   } else {
-    const role = isOwner(params.askerId) ? " (the bot's owner)" : canManage(group, params.askerId) ? ' (a manager of this group)' : '';
-    facts.push(`Asked by: ${asker}${role}`);
+    facts.push(`Asked by: ${asker}${role(params)}`);
   }
   if (repliedTo) facts.push(`They are replying to this message:\n${repliedTo}`);
   if (params.images?.length) facts.push('The image they are asking about is attached.');
@@ -387,6 +407,17 @@ function secretaryTools(params: AskParams) {
   const { group } = params;
   const chatId = group.chatId;
 
+  /** A person may change notes they asked for; the owner and managers may change any. */
+  const noteChangeDenied = (numbers: number[]): string | undefined => {
+    if (canManage(group, params.askerId)) return undefined;
+    const notes = listNotes(chatId);
+    const others = numbers
+      .map((n) => notes.find((note) => note.number === n))
+      .filter((note) => note && (params.askerId === undefined || note.askedBy !== params.asker));
+    if (!others.length) return undefined;
+    return `Note(s) ${others.map((n) => `#${n!.number} (asked by ${n!.askedBy || 'unknown'})`).join(', ')} belong to someone else. Only they, the owner or a manager can change them.`;
+  };
+
   const tools = [
     tool(
       'save_note',
@@ -399,6 +430,32 @@ function secretaryTools(params: AskParams) {
       },
     ),
     tool(
+      'note_edit',
+      'Rewrite one of the group\'s notes by its number (#n in <notes>), e.g. when a preference or decision changed. ' +
+        'People can change their own notes; the owner or a manager can change any.',
+      { number: z.number().int().positive(), note: z.string().min(1).max(1000).describe('The new text of the note.') },
+      async ({ number, note }) => {
+        const denied = noteChangeDenied([number]);
+        if (denied) return failed(denied);
+        const edited = editNote(chatId, number, note, params.asker);
+        return edited ? ok(`Note #${number} is now: ${edited.text}`) : failed(`There is no note #${number}.`);
+      },
+    ) as never,
+    tool(
+      'note_remove',
+      'Delete notes that are wrong, outdated or no longer wanted, by their numbers (#n in <notes>). ' +
+        'People can remove their own notes; the owner or a manager can remove any.',
+      { numbers: z.array(z.number().int().positive()).min(1).max(50) },
+      async ({ numbers }) => {
+        const denied = noteChangeDenied(numbers);
+        if (denied) return failed(denied);
+        const removed = removeNotes(chatId, numbers);
+        return removed.length
+          ? ok(`Removed ${removed.length} note(s): ${removed.map((n) => `#${n.number} ${n.text.slice(0, 80)}`).join('; ')}. The remaining notes are renumbered.`)
+          : failed('None of those note numbers exist.');
+      },
+    ) as never,
+    tool(
       'group_settings',
       "Change this group's settings on the spot (only for the owner or a manager; the bot checks who is asking). " +
         'Give only the fields to change. The current settings are in <settings>.',
@@ -410,13 +467,15 @@ function secretaryTools(params: AskParams) {
           .describe('Topic that receives every answer: a topic name, "here" for the topic of this question, "General", or "off" to answer in each question\'s own topic.'),
         model: z.string().max(80).optional().describe('fable, opus, sonnet, haiku, a full "claude-..." model id, or "default".'),
         effort: z.union([z.enum(EFFORT_LEVELS), z.literal('default')]).optional(),
+        min_repeat_seconds: z.number().int().min(5).max(86400).optional().describe('Shortest gap between repeats of reminder messages and scripts.'),
+        task_min_repeat_minutes: z.number().int().min(1).max(1440).optional().describe('Shortest gap between repeats of tasks (each runs Claude, so each costs).'),
         house_rules: z
           .string()
           .max(3000)
           .optional()
           .describe('The complete new house rules for every answer (replaces the old ones; keep what should stay). Empty string clears them.'),
       },
-      async ({ answer_topic, model, effort, house_rules }) => {
+      async ({ answer_topic, model, effort, house_rules, min_repeat_seconds, task_min_repeat_minutes }) => {
         if (!canManage(group, params.askerId)) {
           return failed("Only the bot's owner or a manager of this group can change its settings. Tell the person that, and who those are (see <settings>).");
         }
@@ -442,6 +501,8 @@ function secretaryTools(params: AskParams) {
         }
         if (effort !== undefined) change.effort = effort === 'default' ? null : effort;
         if (house_rules !== undefined) change.houseRules = house_rules.trim() ? house_rules.trim() : null;
+        if (min_repeat_seconds !== undefined) change.minRepeatSeconds = min_repeat_seconds;
+        if (task_min_repeat_minutes !== undefined) change.minTaskRepeatMinutes = task_min_repeat_minutes;
         const updated = updateGroupSettings(chatId, change);
         if (!updated) return failed('This group is not set up.');
         Object.assign(group, updated);
@@ -450,6 +511,35 @@ function secretaryTools(params: AskParams) {
       },
     ) as never,
   ];
+
+  if (params.startJob) {
+    const startJob = params.startJob;
+    tools.push(
+      tool(
+        'background_job',
+        'Hand work that takes more than a few minutes (a booking flow, a big scrape or analysis, a long build, research across many sites) ' +
+          'to a background run of yourself with up to an hour and many more steps. It posts its result as a reply to this request when done. ' +
+          'Then tell the person it is running and roughly what to expect. /stop cancels it.',
+        {
+          title: z.string().min(1).max(80).describe('A few words naming the job, shown to the group.'),
+          instruction: z
+            .string()
+            .min(1)
+            .max(8000)
+            .describe('Everything the job needs to know, standing on its own: the goal, details from the conversation, what to post at the end.'),
+          effort: z.enum(EFFORT_LEVELS).optional(),
+        },
+        async ({ title, instruction, effort }) => {
+          try {
+            const id = startJob(instruction, title, effort);
+            return ok(`Background job ${id} ("${title}") started. It will post its result as a reply when it finishes.`);
+          } catch (error) {
+            return failed((error as Error).message);
+          }
+        },
+      ) as never,
+    );
+  }
 
   if (params.telegramCall) {
     const telegramCall = params.telegramCall;
@@ -527,8 +617,10 @@ function secretaryTools(params: AskParams) {
               .string()
               .optional()
               .describe(`Five-field cron pattern in ${config.SECRETARY_TIMEZONE}, e.g. "0 9 * * 1" for Mondays at 09:00.`),
+            every_seconds: z.number().int().positive().max(31 * 86400).optional().describe('Repeat every this many seconds, e.g. 30.'),
+            until: z.string().optional().describe(`For repeating ones: stop after this local date and time, e.g. 2026-12-01T19:30 (${config.SECRETARY_TIMEZONE}).`),
           },
-          async ({ kind, text, at, cron, effort }) => {
+          async ({ kind, text, at, cron, effort, every_seconds, until }) => {
             try {
               const schedule = createSchedule(chatId, {
                 kind,
@@ -536,6 +628,8 @@ function secretaryTools(params: AskParams) {
                 effort,
                 at,
                 cron,
+                everySeconds: every_seconds,
+                until,
                 threadId: params.threadId,
                 topic: params.topic,
                 createdBy: params.asker,
@@ -812,7 +906,7 @@ export function buildSecretaryOptions(
     settingSources: [],
     skills: [],
     persistSession: false,
-    maxTurns: config.SECRETARY_MAX_TURNS,
+    maxTurns: params.maxTurns ?? config.SECRETARY_MAX_TURNS,
     abortController,
     env: subprocessEnv(),
     ...(config.CLAUDE_USE_BUNDLED_EXECUTABLE ? {} : { pathToClaudeCodeExecutable: config.CLAUDE_EXECUTABLE_PATH }),
@@ -828,7 +922,7 @@ export async function askSecretary(params: AskParams, abortController = new Abor
   const options = buildSecretaryOptions(params, abortController, toolsUsed);
 
   const text = buildPrompt(params);
-  const timeout = setTimeout(() => abortController.abort(), config.SECRETARY_TIMEOUT_MS);
+  const timeout = setTimeout(() => abortController.abort(), params.timeoutMs ?? config.SECRETARY_TIMEOUT_MS);
 
   let answer = '';
   let lastAssistantText = '';

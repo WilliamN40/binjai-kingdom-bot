@@ -397,16 +397,66 @@ export function appendNote(chatId: number, note: string, savedBy: string): void 
   fs.appendFileSync(notesPath(chatId), `- [${stamp}] (asked by ${flatten(savedBy)}) ${flatten(note)}\n`, 'utf8');
 }
 
-/** The most recent notes, trimmed to what is reasonable to put in every prompt. */
-export function readNotes(chatId: number): string {
+export interface Note {
+  /** 1-based position in notes.md, as shown to the secretary ("#3"). */
+  number: number;
+  /** Who asked for it, as written: a person's label or "hook <name>". */
+  askedBy: string;
+  text: string;
+  line: string;
+}
+
+const NOTE_LINE = /^- \[[^\]]*\] \(asked by (.*?)\) (.*)$/;
+
+export function listNotes(chatId: number): Note[] {
+  let raw: string;
   try {
-    const notes = fs.readFileSync(notesPath(chatId), 'utf8').trim();
-    if (notes.length <= NOTES_PROMPT_CHARS) return notes;
-    const tail = notes.slice(-NOTES_PROMPT_CHARS);
-    return tail.slice(tail.indexOf('\n') + 1);
+    raw = fs.readFileSync(notesPath(chatId), 'utf8');
   } catch {
-    return '';
+    return [];
   }
+  return raw
+    .split('\n')
+    .filter((line) => line.trim())
+    .map((line, i) => {
+      const match = line.match(NOTE_LINE);
+      return { number: i + 1, askedBy: match?.[1] ?? '', text: match?.[2] ?? line.replace(/^- /, ''), line };
+    });
+}
+
+function writeNotes(chatId: number, notes: Note[]): void {
+  ensureGroupDir(chatId);
+  atomicWriteFileSync(notesPath(chatId), notes.map((n) => n.line).join('\n') + (notes.length ? '\n' : ''));
+}
+
+/** Remove notes by number. Returns the ones removed. */
+export function removeNotes(chatId: number, numbers: number[]): Note[] {
+  const notes = listNotes(chatId);
+  const wanted = new Set(numbers);
+  writeNotes(chatId, notes.filter((n) => !wanted.has(n.number)));
+  return notes.filter((n) => wanted.has(n.number));
+}
+
+/** Replace a note's text, keeping its place; it is stamped as edited now, by whom. */
+export function editNote(chatId: number, number: number, text: string, editedBy: string): Note | undefined {
+  const notes = listNotes(chatId);
+  const note = notes.find((n) => n.number === number);
+  if (!note) return undefined;
+  const { stamp } = localTime(new Date());
+  note.line = `- [${stamp}] (asked by ${note.askedBy || flatten(editedBy)}) ${flatten(text)} (edited by ${flatten(editedBy)})`;
+  note.text = flatten(text);
+  writeNotes(chatId, notes);
+  return note;
+}
+
+/** The most recent notes, numbered so they can be edited, trimmed to what is reasonable to put in every prompt. */
+export function readNotes(chatId: number): string {
+  const notes = listNotes(chatId)
+    .map((n) => `#${n.number} ${n.line}`)
+    .join('\n');
+  if (notes.length <= NOTES_PROMPT_CHARS) return notes;
+  const tail = notes.slice(-NOTES_PROMPT_CHARS);
+  return tail.slice(tail.indexOf('\n') + 1);
 }
 
 // ── Lifecycle ────────────────────────────────────────────────────────

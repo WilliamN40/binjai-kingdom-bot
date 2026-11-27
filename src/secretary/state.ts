@@ -32,6 +32,10 @@ export interface GroupState {
   houseRules?: string;
   /** Telegram user ids who may change this group's settings, besides the bot's owners. */
   managers?: number[];
+  /** Shortest gap between repeats of a reminder message or script (seconds). */
+  minRepeatSeconds?: number;
+  /** Shortest gap between repeats of a task, which runs Claude each time (minutes). */
+  minTaskRepeatMinutes?: number;
 }
 
 export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
@@ -211,6 +215,8 @@ export function enableGroup(
     answerTopic: existing?.answerTopic,
     houseRules: existing?.houseRules,
     managers: existing?.managers,
+    minRepeatSeconds: existing?.minRepeatSeconds,
+    minTaskRepeatMinutes: existing?.minTaskRepeatMinutes,
   };
   s.groups[String(chatId)] = group;
   save();
@@ -279,6 +285,8 @@ export interface GroupSettingsChange {
   answerTopic?: number | null;
   houseRules?: string | null;
   managers?: number[];
+  minRepeatSeconds?: number | null;
+  minTaskRepeatMinutes?: number | null;
 }
 
 /** Apply a change to the group's settings; null clears a setting back to its default. */
@@ -296,6 +304,8 @@ export function updateGroupSettings(chatId: number, change: GroupSettingsChange)
   set('effort');
   set('answerTopic');
   set('houseRules');
+  set('minRepeatSeconds');
+  set('minTaskRepeatMinutes');
   if (change.managers) {
     if (change.managers.length) group.managers = [...new Set(change.managers)];
     else delete group.managers;

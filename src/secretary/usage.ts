@@ -11,7 +11,7 @@ import { groupDir } from './transcript.js';
 export interface UsageEntry {
   /** ISO time the run finished. */
   t: string;
-  kind: 'ask' | 'task' | 'hook' | 'digest';
+  kind: 'ask' | 'task' | 'hook' | 'digest' | 'job';
   userId?: number;
   name: string;
   costUsd: number;
