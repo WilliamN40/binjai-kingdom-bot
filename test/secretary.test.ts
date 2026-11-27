@@ -278,11 +278,12 @@ test('bad schedules are refused with a reason', () => {
     schedule.createSchedule(chatId, { kind: 'message', text: 'x', createdBy: 'Alice', ...input } as never);
   assert.throws(make({ at: '2020-01-01T09:00' }), /already in the past/);
   assert.throws(make({ at: 'tomorrow at nine' }), /must look like/);
-  assert.throws(make({ cron: '* * * * *' }), /at most every 15 minutes/);
+  assert.throws(make({ every_seconds: 2, everySeconds: 2 }), /at most every 10 seconds/);
   assert.throws(make({ cron: '0 0 9 * * 1' }), /five fields/);
   assert.throws(make({ cron: 'x y z a b' }), /Not a valid cron pattern/);
-  assert.throws(make({}), /either "at"/);
-  assert.throws(make({ at: '2099-01-01T09:00', cron: '0 9 * * 1' }), /either "at"/);
+  assert.throws(make({}), /exactly one of/);
+  assert.throws(make({ at: '2099-01-01T09:00', cron: '0 9 * * 1' }), /exactly one of/);
+  assert.throws(make({ cron: '0 9 * * *', until: '2020-01-01T00:00' }), /already in the past/);
   assert.equal(schedule.listSchedules(chatId).length, 0);
 });
 
@@ -293,7 +294,7 @@ test('a script schedule takes a workspace path, may repeat often, and tasks can 
   assert.match(schedule.describeSchedule(script), /script.*scripts\/check_prs\.py/);
   assert.throws(() => schedule.createSchedule(chatId, { kind: 'script', text: '../other/x.py', cron: '*/5 * * * *', createdBy: 'A' }), /path of a script/);
   assert.throws(() => schedule.createSchedule(chatId, { kind: 'script', text: 'rm -rf x; y.py', cron: '*/5 * * * *', createdBy: 'A' }), /path of a script/);
-  assert.throws(() => schedule.createSchedule(chatId, { kind: 'script', text: 'a.py', cron: '* * * * *', createdBy: 'A' }), /at most every 5 minutes/);
+  assert.equal(schedule.createSchedule(chatId, { kind: 'script', text: 'a.py', cron: '* * * * *', createdBy: 'A' }).cron, '* * * * *', 'scripts may run every minute');
   assert.throws(() => schedule.createSchedule(chatId, { kind: 'task', text: 'recap', cron: '*/5 * * * *', createdBy: 'A' }), /at most every 15 minutes/);
 
   const task = schedule.createSchedule(chatId, { kind: 'task', text: 'Deep research', cron: '0 8 * * *', effort: 'high', createdBy: 'Alice' });
@@ -689,4 +690,23 @@ test('votes in the bot\'s polls are described for the record', async () => {
     '* The poll "Dinner?" (msg 120) closed: Song Fa 3, Hai Di Lao 1 (4 voters)',
   );
   assert.equal(polls.findPoll('nope'), undefined);
+});
+
+test('schedules can repeat every few seconds until a set time, within limits the group can change', () => {
+  const chatId = -1007770020;
+  state.enableGroup(chatId, { title: 'Pings', enabledBy: 111 });
+  const ping = schedule.createSchedule(chatId, { kind: 'message', text: 'turun!', everySeconds: 30, until: '2099-01-01T19:30', createdBy: 'A' });
+  assert.match(schedule.describeSchedule(ping), /every 30 s until 2099-01-01 19:30/);
+  const first = new Date(ping.nextRun).getTime();
+  assert.equal(schedule.takeDue(chatId, new Date(first)).length, 1);
+  assert.equal(new Date(schedule.listSchedules(chatId)[0].nextRun).getTime(), first + 30_000, 'keeps its rhythm');
+  schedule.takeDue(chatId, new Date(first + 3_600_000));
+  assert.ok(new Date(schedule.listSchedules(chatId)[0].nextRun).getTime() > first + 3_600_000, 'no catching up after downtime');
+  assert.equal(schedule.takeDue(chatId, new Date('2099-01-01T11:31:00Z')).length, 1);
+  assert.equal(schedule.listSchedules(chatId).length, 0, 'gone after "until"');
+
+  assert.throws(() => schedule.createSchedule(chatId, { kind: 'task', text: 'x', everySeconds: 60, createdBy: 'A' }), /at most every 15 minutes/);
+  state.updateGroupSettings(chatId, { minRepeatSeconds: 60, minTaskRepeatMinutes: 1 });
+  assert.throws(() => schedule.createSchedule(chatId, { kind: 'message', text: 'x', everySeconds: 30, createdBy: 'A' }), /at most every 60 seconds/);
+  assert.equal(schedule.createSchedule(chatId, { kind: 'task', text: 'x', everySeconds: 60, createdBy: 'A' }).everySeconds, 60);
 });

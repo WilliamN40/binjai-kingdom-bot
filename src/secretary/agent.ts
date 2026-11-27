@@ -46,7 +46,7 @@ import {
   sandboxEnabled,
   writeSandboxFile,
 } from './sandbox.js';
-import { cancelSchedule, createSchedule, describeSchedule, listSchedules } from './schedule.js';
+import { cancelSchedule, createSchedule, describeSchedule, listSchedules, repeatLimits } from './schedule.js';
 import { listSecrets } from './secrets.js';
 import { methodLevel } from './telegram-api.js';
 import {
@@ -199,7 +199,7 @@ Most questions are answered faster straight from the record. Use the workspace w
 
 ## Reminders and recurring tasks
 
-schedule_create sets up something for later. Kind "message" posts the text exactly as written when the time comes. Kind "task" runs you again at that time with the text as your instruction and posts your answer, which suits things like "post a recap of the past week"; a task can carry its own effort level when someone asks for a lighter or deeper run than usual.${sandboxEnabled() ? ` Kind "script" runs a script from the workspace (give its path as the text) without involving you and posts whatever it prints, or nothing if it prints nothing. Instead of text it may print {"actions": [...]} in the hook format below, to delete or pin earlier messages by message_id, post photos or save notes (for example an hourly clean-up of messages a hook queued). It uses no Claude, so prefer it for routine checks, and it may repeat as often as every ${config.SECRETARY_MIN_SCRIPT_REPEAT_MINUTES} minutes.` : ''} Use "at" for one local date and time, or "cron" (five fields, timezone ${tz}) to repeat; work the date out from the current time given with the question. Write the text so it makes sense on its own when it fires, since the conversation around it will be gone. The group's schedules are listed with each question, and schedule_cancel removes one by its id. After scheduling, confirm what will happen and when.`
+schedule_create sets up something for later. Kind "message" posts the text exactly as written when the time comes. Kind "task" runs you again at that time with the text as your instruction and posts your answer, which suits things like "post a recap of the past week"; a task can carry its own effort level when someone asks for a lighter or deeper run than usual.${sandboxEnabled() ? ` Kind "script" runs a script from the workspace (give its path as the text) without involving you and posts whatever it prints, or nothing if it prints nothing. Instead of text it may print {"actions": [...]} in the hook format below, to delete or pin earlier messages by message_id, post photos or save notes (for example an hourly clean-up of messages a hook queued). It uses no Claude, so prefer it for routine checks,.` : ''} Use "at" for one local date and time, "cron" (five fields, timezone ${tz}) to repeat at set times, or "every_seconds" to repeat every N seconds (e.g. a ping every 30 seconds); "until" ends a repeating one at a local time. The shortest allowed gaps are in <settings> and the owner or a manager can change them; work the date out from the current time given with the question. Write the text so it makes sense on its own when it fires, since the conversation around it will be gone. The group's schedules are listed with each question, and schedule_cancel removes one by its id. After scheduling, confirm what will happen and when.`
     : '';
 
   const house = config.SECRETARY_INSTRUCTIONS.trim()
@@ -322,6 +322,7 @@ export function describeSettings(group: GroupState): string {
     `Model: ${group.model ?? `default (${config.SECRETARY_MODEL || config.CLAUDE_MODEL})`}`,
     `Effort: ${group.effort ?? `default (${config.SECRETARY_EFFORT})`}`,
     `House rules: ${group.houseRules?.trim() ? group.houseRules.trim() : 'none'}`,
+    `Repeats: reminders and scripts at most every ${repeatLimits(group.chatId).seconds} s, tasks at most every ${repeatLimits(group.chatId).taskMinutes} min`,
     `Owner: ${owners.join(', ') || 'none'}; managers: ${managers.join(', ') || 'none'} (they can change these settings)`,
     `Secrets (environment variables in the workspace): ${listSecrets(group.chatId).map((s) => s.name).join(', ') || 'none'}`,
     `MCP servers: ${listMcpServers(group.chatId).map(describeMcpServer).join('; ') || 'none'}`,
@@ -466,13 +467,15 @@ function secretaryTools(params: AskParams) {
           .describe('Topic that receives every answer: a topic name, "here" for the topic of this question, "General", or "off" to answer in each question\'s own topic.'),
         model: z.string().max(80).optional().describe('fable, opus, sonnet, haiku, a full "claude-..." model id, or "default".'),
         effort: z.union([z.enum(EFFORT_LEVELS), z.literal('default')]).optional(),
+        min_repeat_seconds: z.number().int().min(5).max(86400).optional().describe('Shortest gap between repeats of reminder messages and scripts.'),
+        task_min_repeat_minutes: z.number().int().min(1).max(1440).optional().describe('Shortest gap between repeats of tasks (each runs Claude, so each costs).'),
         house_rules: z
           .string()
           .max(3000)
           .optional()
           .describe('The complete new house rules for every answer (replaces the old ones; keep what should stay). Empty string clears them.'),
       },
-      async ({ answer_topic, model, effort, house_rules }) => {
+      async ({ answer_topic, model, effort, house_rules, min_repeat_seconds, task_min_repeat_minutes }) => {
         if (!canManage(group, params.askerId)) {
           return failed("Only the bot's owner or a manager of this group can change its settings. Tell the person that, and who those are (see <settings>).");
         }
@@ -498,6 +501,8 @@ function secretaryTools(params: AskParams) {
         }
         if (effort !== undefined) change.effort = effort === 'default' ? null : effort;
         if (house_rules !== undefined) change.houseRules = house_rules.trim() ? house_rules.trim() : null;
+        if (min_repeat_seconds !== undefined) change.minRepeatSeconds = min_repeat_seconds;
+        if (task_min_repeat_minutes !== undefined) change.minTaskRepeatMinutes = task_min_repeat_minutes;
         const updated = updateGroupSettings(chatId, change);
         if (!updated) return failed('This group is not set up.');
         Object.assign(group, updated);
@@ -612,8 +617,10 @@ function secretaryTools(params: AskParams) {
               .string()
               .optional()
               .describe(`Five-field cron pattern in ${config.SECRETARY_TIMEZONE}, e.g. "0 9 * * 1" for Mondays at 09:00.`),
+            every_seconds: z.number().int().positive().max(31 * 86400).optional().describe('Repeat every this many seconds, e.g. 30.'),
+            until: z.string().optional().describe(`For repeating ones: stop after this local date and time, e.g. 2026-12-01T19:30 (${config.SECRETARY_TIMEZONE}).`),
           },
-          async ({ kind, text, at, cron, effort }) => {
+          async ({ kind, text, at, cron, effort, every_seconds, until }) => {
             try {
               const schedule = createSchedule(chatId, {
                 kind,
@@ -621,6 +628,8 @@ function secretaryTools(params: AskParams) {
                 effort,
                 at,
                 cron,
+                everySeconds: every_seconds,
+                until,
                 threadId: params.threadId,
                 topic: params.topic,
                 createdBy: params.asker,

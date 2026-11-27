@@ -1144,7 +1144,22 @@ function dispatchHooks(api: Api, me: BotFullInfo, group: GroupState, msg: Messag
 
 /** Builds the function the scheduler calls for each reminder or task that comes due. */
 export function createScheduleDeliverer(api: Api, me: BotFullInfo) {
+  // A fast-repeating schedule whose last run is still going is skipped, not stacked up.
+  const busy = new Set<string>();
   return async (chatId: number, schedule: Schedule): Promise<void> => {
+    const key = `${chatId}:${schedule.id}`;
+    if (busy.has(key)) return;
+    busy.add(key);
+    try {
+      await deliverSchedule(api, me, chatId, schedule);
+    } finally {
+      busy.delete(key);
+    }
+  };
+}
+
+async function deliverSchedule(api: Api, me: BotFullInfo, chatId: number, schedule: Schedule): Promise<void> {
+  {
     const group = getGroup(chatId);
     if (!group?.enabled) return;
 

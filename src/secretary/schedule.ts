@@ -14,7 +14,7 @@ import { randomBytes } from 'crypto';
 import { Cron } from 'croner';
 import { config } from '../config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { listGroups, type EffortLevel } from './state.js';
+import { getGroup, listGroups, type EffortLevel } from './state.js';
 import { groupDir, localTime } from './transcript.js';
 
 export interface Schedule {
@@ -31,6 +31,10 @@ export interface Schedule {
   cron?: string;
   /** Local date-time for a one-off schedule, e.g. "2026-12-01T09:00". */
   at?: string;
+  /** Repeat every this many seconds (finer than cron allows). */
+  everySeconds?: number;
+  /** Stop repeating after this moment (ISO 8601 UTC). */
+  until?: string;
   /** Next firing time, ISO 8601 UTC. */
   nextRun: string;
   /** Forum topic the schedule was created in; its messages are posted there. */
@@ -49,13 +53,43 @@ export interface ScheduleInput {
   effort?: EffortLevel;
   at?: string;
   cron?: string;
+  everySeconds?: number;
+  /** Local date-time after which a repeating schedule stops, e.g. "2026-12-01T19:30". */
+  until?: string;
   threadId?: number;
   topic?: string;
   createdBy: string;
   createdById?: number;
 }
 
-const TICK_MS = 20_000;
+/** Shortest gaps allowed between repeats in this group (the owner or a manager can change them). */
+export function repeatLimits(chatId: number): { seconds: number; taskMinutes: number } {
+  const group = getGroup(chatId);
+  return {
+    seconds: group?.minRepeatSeconds ?? DEFAULT_MIN_REPEAT_SECONDS,
+    taskMinutes: group?.minTaskRepeatMinutes ?? config.SECRETARY_MIN_REPEAT_MINUTES,
+  };
+}
+
+export const DEFAULT_MIN_REPEAT_SECONDS = 10;
+/** Nothing can repeat faster than this, whatever the settings say. */
+const FLOOR_SECONDS = 5;
+
+function parseLocal(value: string, label: string): Date {
+  const at = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(at)) throw new Error(`"${label}" must look like 2026-12-01T09:00 (local time).`);
+  let next: Date | undefined;
+  try {
+    // From long ago, so a date in the past still parses (and is then refused as past).
+    next = nextOccurrence({ at }, new Date(0));
+  } catch {
+    throw new Error(`"${at}" is not a valid date and time.`);
+  }
+  if (!next) throw new Error(`"${at}" is not a valid date and time.`);
+  return next;
+}
+
+const TICK_MS = 5_000;
 const cache = new Map<number, Schedule[]>();
 
 function filePath(chatId: number): string {
@@ -95,9 +129,15 @@ export function createSchedule(chatId: number, input: ScheduleInput): Schedule {
   if (input.kind === 'script' && (!/^[A-Za-z0-9_][\w./-]{0,199}$/.test(text) || text.split('/').includes('..'))) {
     throw new Error('For a script schedule, the text must be the path of a script in the workspace, e.g. scripts/check_prs.py.');
   }
-  if (Boolean(input.at) === Boolean(input.cron)) {
-    throw new Error('Give either "at" (one time) or "cron" (repeating), not both.');
+  if ([input.at, input.cron, input.everySeconds].filter((v) => v !== undefined && v !== '').length !== 1) {
+    throw new Error('Give exactly one of "at" (one time), "cron" (repeating at set times) or "every_seconds" (repeating every N seconds).');
   }
+  const limits = repeatLimits(chatId);
+  // A task runs Claude each time, so it has its own (larger) minimum gap.
+  const minMs = input.kind === 'task' ? limits.taskMinutes * 60_000 : Math.max(FLOOR_SECONDS, limits.seconds) * 1000;
+  const describeMin = input.kind === 'task' ? `${limits.taskMinutes} minutes` : `${Math.max(FLOOR_SECONDS, limits.seconds)} seconds`;
+  const until = input.until ? parseLocal(input.until, 'until') : undefined;
+  if (until && until.getTime() <= Date.now()) throw new Error(`"until" (${input.until}) is already in the past.`);
 
   const schedules = load(chatId);
   if (schedules.length >= config.SECRETARY_MAX_SCHEDULES_PER_GROUP) {
@@ -119,6 +159,13 @@ export function createSchedule(chatId: number, input: ScheduleInput): Schedule {
     }
     if (!next) throw new Error(`${at} is already in the past (now is ${localTime(now).stamp}).`);
     input = { ...input, at };
+  } else if (input.everySeconds !== undefined) {
+    const every = Math.round(input.everySeconds);
+    if (!(every * 1000 >= minMs)) {
+      throw new Error(`In this group a repeating ${input.kind} can fire at most every ${describeMin} (the owner or a manager can change that).`);
+    }
+    next = new Date(now.getTime() + every * 1000);
+    input = { ...input, everySeconds: every };
   } else {
     const cron = input.cron!.trim().replace(/\s+/g, ' ');
     if (cron.split(' ').length !== 5) {
@@ -131,11 +178,9 @@ export function createSchedule(chatId: number, input: ScheduleInput): Schedule {
       throw new Error(`Not a valid cron pattern: ${(error as Error).message}`);
     }
     if (!runs.length) throw new Error('That pattern never fires.');
-    // Scripts use no Claude, so they may run more often than reminders and tasks.
-    const minMinutes = input.kind === 'script' ? config.SECRETARY_MIN_SCRIPT_REPEAT_MINUTES : config.SECRETARY_MIN_REPEAT_MINUTES;
     for (let i = 1; i < runs.length; i++) {
-      if (runs[i].getTime() - runs[i - 1].getTime() < minMinutes * 60_000) {
-        throw new Error(`A repeating ${input.kind === 'script' ? 'script' : 'schedule'} can fire at most every ${minMinutes} minutes.`);
+      if (runs[i].getTime() - runs[i - 1].getTime() < minMs) {
+        throw new Error(`In this group a repeating ${input.kind} can fire at most every ${describeMin} (the owner or a manager can change that).`);
       }
     }
     next = runs[0];
@@ -154,6 +199,8 @@ export function createSchedule(chatId: number, input: ScheduleInput): Schedule {
     effort: input.kind === 'task' ? input.effort : undefined,
     cron: input.cron,
     at: input.at,
+    ...(input.everySeconds !== undefined ? { everySeconds: input.everySeconds } : {}),
+    ...(until ? { until: until.toISOString() } : {}),
     nextRun: next.toISOString(),
     threadId: input.threadId,
     topic: input.topic,
@@ -180,9 +227,13 @@ export function cancelSchedule(chatId: number, id: string): Schedule | undefined
 }
 
 export function describeSchedule(schedule: Schedule): string {
-  const when = schedule.cron
-    ? `repeats on cron "${schedule.cron}", next ${localTime(new Date(schedule.nextRun)).stamp}`
-    : `once at ${localTime(new Date(schedule.nextRun)).stamp}`;
+  const next = localTime(new Date(schedule.nextRun)).stamp;
+  const until = schedule.until ? ` until ${localTime(new Date(schedule.until)).stamp}` : '';
+  const when = schedule.everySeconds
+    ? `repeats every ${schedule.everySeconds} s${until}, next ${next}`
+    : schedule.cron
+      ? `repeats on cron "${schedule.cron}"${until}, next ${next}`
+      : `once at ${next}`;
   const where = schedule.topic ? ` in #${schedule.topic}` : '';
   const what =
     schedule.kind === 'task'
@@ -209,10 +260,19 @@ export function takeDue(chatId: number, now = new Date()): Schedule[] {
   for (const schedule of due) {
     let next: Date | undefined;
     try {
-      next = schedule.cron ? nextOccurrence(schedule, now) : undefined;
+      if (schedule.everySeconds) {
+        // Keep the rhythm, but never try to catch up on missed beats after downtime.
+        const step = schedule.everySeconds * 1000;
+        let t = new Date(schedule.nextRun).getTime() + step;
+        if (t <= now.getTime()) t = now.getTime() + step;
+        next = new Date(t);
+      } else {
+        next = schedule.cron ? nextOccurrence(schedule, now) : undefined;
+      }
     } catch {
       next = undefined;
     }
+    if (next && schedule.until && next.getTime() > new Date(schedule.until).getTime()) next = undefined;
     if (next) {
       schedule.nextRun = next.toISOString();
       schedule.lastRun = now.toISOString();
