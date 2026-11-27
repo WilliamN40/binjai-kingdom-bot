@@ -52,8 +52,15 @@ build_and_start() {
   cd "$APP_DIR" || return 1
   log "building"
   docker compose build >> "$LOG" 2>&1 || return 1
+  # The groups' machines are rebuilt whenever their image changes, which stops their background
+  # programs, so their image is only rebuilt when its own files changed (or it does not exist yet).
   if grep -q '^SANDBOX_BACKEND=workbench' .env 2>/dev/null; then
-    docker compose --profile image build workbench-image >> "$LOG" 2>&1 || return 1
+    if ! docker image inspect binjaibot-workbench:latest >/dev/null 2>&1 \
+      || [ -z "$PREVIOUS" ] \
+      || ! git_as_app diff --quiet "$PREVIOUS" HEAD -- sandbox/workbench; then
+      log "building the workbench image"
+      docker compose --profile image build workbench-image >> "$LOG" 2>&1 || return 1
+    fi
   fi
   log "starting"
   docker compose up -d >> "$LOG" 2>&1 || return 1
