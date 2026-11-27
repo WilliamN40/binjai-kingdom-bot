@@ -11,12 +11,28 @@ import type { BotFullInfo, Message } from 'grammy/types';
 import { config } from '../config.js';
 import { processMessageForTelegram, splitMessage } from '../telegram/markdown.js';
 import type { ImageAttachment } from '../providers/types.js';
-import { askSecretary } from './agent.js';
+import { askSecretary, describeSettings, messageLinkBase } from './agent.js';
 import { describeContent, formatMessageBody, senderLabel, senderOf, topicNameFromReply } from './format.js';
 import { sendBackup } from './backup.js';
-import { describeHook, forgetHooks, hasActiveHooks, listHooks, runHooks, setHookEnabled, type HookOutcome } from './hooks.js';
-import { clearSandbox, runInSandbox, sandboxEnabled, uploadToSandbox } from './sandbox.js';
+import {
+  describeHook,
+  forgetHooks,
+  hasActiveHooks,
+  listHooks,
+  parseActions,
+  runHooks,
+  runHooksForEvent,
+  setHookEnabled,
+  type HookAction,
+  type HookEventType,
+  type HookOutcome,
+} from './hooks.js';
+import { forgetMcpServers } from './mcp.js';
+import { callTelegram, methodLevel, prepareCall, sentMessages } from './telegram-api.js';
+import { confirmDeploy, currentVersion, deployEnabled, describePlan, planDeploy, takeDeployResult } from './deploy.js';
+import { clearSandbox, readSandboxFile, runInSandbox, sandboxEnabled, sandboxMachineAction, uploadToSandbox } from './sandbox.js';
 import { formatUsage, logUsage } from './usage.js';
+import { forgetSecrets, listSecrets, migrateSecrets, removeSecret, setSecret } from './secrets.js';
 import { describeSchedule, forgetSchedules, listSchedules, type Schedule } from './schedule.js';
 import {
   claimOwnership,
@@ -30,9 +46,15 @@ import {
   migrateGroupState,
   removeGroup,
   sandboxUidFor,
+  setAnswerTopic,
   setGroupEffort,
+  setGroupModel,
   setWelcome,
   EFFORT_LEVELS,
+  MODEL_CHOICES,
+  canManage,
+  resolveModel,
+  updateGroupSettings,
   type EffortLevel,
   touchGroup,
   type GroupState,
@@ -42,11 +64,14 @@ import {
   appendNote,
   appendTranscript,
   deleteGroupData,
+  findMedia,
+  findMember,
   getTopicName,
   listTopicNames,
   localTime,
   migrateGroupData,
   noteMember,
+  recordMedia,
   setTopicName,
   transcriptStats,
 } from './transcript.js';
@@ -59,6 +84,9 @@ const MAX_IMAGE_BYTES = 4_500_000;
 const MAX_DOWNLOAD_BYTES = 20_000_000;
 const CHUNK_LENGTH = 4000;
 const VISION_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+/** Telegram's limit for a photo upload; larger pictures are sent as files. */
+const MAX_PHOTO_UPLOAD_BYTES = 10_000_000;
+const PHOTO_FILE = /\.(jpe?g|png|webp)$/i;
 
 export const GROUP_COMMANDS = [
   { command: 'ask', description: 'Ask the secretary about anything said in this group' },
@@ -69,6 +97,14 @@ export const GROUP_COMMANDS = [
   { command: 'usage', description: 'Who used how much Claude (e.g. /usage 7)' },
   { command: 'stop', description: 'Stop the answer the secretary is working on' },
   { command: 'effort', description: 'Show or set how hard the secretary thinks per answer' },
+  { command: 'model', description: 'Show or set which Claude model answers (owner)' },
+  { command: 'answerhere', description: 'Post every answer in this topic (owner; /answerhere off)' },
+  { command: 'settings', description: "Show this group's settings (who can change them, and how)" },
+  { command: 'manager', description: 'Owner: /manager add|remove @username (managers can change settings)' },
+  { command: 'deploy', description: 'Owner: deploy a new version of the bot (/deploy [branch], then confirm)' },
+  { command: 'version', description: 'Which version of the bot is running' },
+  { command: 'machine', description: "Status of this group's own machine; /machine reset rebuilds it" },
+  { command: 'secret', description: 'List secrets, or add a key: /secret NAME value (owner/managers; best in DM)' },
   { command: 'status', description: 'Show what the secretary is recording' },
   { command: 'help', description: 'How to use the secretary' },
 ];
@@ -80,7 +116,15 @@ interface Target {
   chatId: number;
   threadId?: number;
   replyTo?: number;
+  /**
+   * The message replied to is in another topic. The reply then names the chat explicitly
+   * (Telegram's "reply in another chat") and must fail rather than turn into a plain message.
+   */
+  replyAcross?: boolean;
 }
+
+/** Groups where Telegram would not take a reply across topics; answers there link back instead. */
+const crossTopicReplyFails = new Set<number>();
 
 /** Runs at most `limit` answers at once; the rest wait their turn. */
 class Semaphore {
@@ -124,6 +168,24 @@ function targetOf(msg: Message): Target {
   return { chatId: msg.chat.id, threadId: threadIdOf(msg), replyTo: msg.message_id };
 }
 
+/**
+ * Where an answer goes: the asker's own topic, or the group's answer topic if the
+ * owner set one with /answerhere. Telegram cannot reply across topics, so a moved
+ * answer is a plain message that links back to the question instead.
+ */
+function answerTargetOf(group: GroupState, msg: Message): { target: Target; moved: boolean } {
+  const own = targetOf(msg);
+  if (!isForum(msg) || group.answerTopic === undefined) return { target: own, moved: false };
+  // 0 stands for the General topic, which has no thread id.
+  const threadId = group.answerTopic === 0 ? undefined : group.answerTopic;
+  if (threadId === own.threadId) return { target: own, moved: false };
+  return { target: { chatId: own.chatId, threadId }, moved: true };
+}
+
+function topicNameOf(chatId: number, threadId: number | undefined): string {
+  return threadId === undefined ? GENERAL_TOPIC : (getTopicName(chatId, threadId) ?? `topic ${threadId}`);
+}
+
 function isForum(msg: Message): boolean {
   return msg.chat.type === 'supergroup' && msg.chat.is_forum === true;
 }
@@ -159,9 +221,39 @@ function sendOptions(target: Target, withReply: boolean) {
     message_thread_id: target.threadId,
     link_preview_options: { is_disabled: true },
     ...(withReply && target.replyTo
-      ? { reply_parameters: { message_id: target.replyTo, allow_sending_without_reply: true } }
+      ? {
+          reply_parameters: target.replyAcross
+            ? { message_id: target.replyTo, chat_id: target.chatId, allow_sending_without_reply: false }
+            : { message_id: target.replyTo, allow_sending_without_reply: true },
+        }
       : {}),
   };
+}
+
+/**
+ * Post an answer in another topic as a real reply to the question. Returns undefined when
+ * Telegram refuses, so the caller can fall back to a link. Whether this works across topics
+ * of one group is checked on the first try and remembered.
+ */
+async function sendAcrossTopics(api: Api, target: Target, question: Message, text: string): Promise<Message | undefined> {
+  if (crossTopicReplyFails.has(target.chatId)) return undefined;
+  let sent: Message | undefined;
+  try {
+    sent = await sendFormatted(api, { ...target, replyTo: question.message_id, replyAcross: true }, text);
+  } catch (error) {
+    if (!(error instanceof GrammyError) || error.error_code !== 400) throw error;
+    console.warn(`[Secretary] Cross-topic reply refused in ${target.chatId} (${error.description}); linking instead`);
+    crossTopicReplyFails.add(target.chatId);
+    return undefined;
+  }
+  // Posted, but check it is where it should be and shows as a reply; if not, link from now on.
+  const thread = sent?.is_topic_message ? sent.message_thread_id : undefined;
+  const replied = sent?.reply_to_message?.message_id === question.message_id || sent?.external_reply !== undefined;
+  if (sent && (thread !== target.threadId || !replied)) {
+    console.warn(`[Secretary] Cross-topic reply in ${target.chatId} landed in thread ${thread ?? 'General'} (reply: ${replied}); linking from now on`);
+    crossTopicReplyFails.add(target.chatId);
+  }
+  return sent;
 }
 
 /** `clearKeyboard` also removes a custom keyboard left in the chat by a previous bot setup. */
@@ -281,6 +373,37 @@ async function gatherAttachments(api: Api, group: GroupState, messages: Array<Me
 
 // ── Recording ────────────────────────────────────────────────────────
 
+/** The picture in a message that the secretary could look at: a photo, or an image sent as a file. */
+function pictureOf(msg: Message): { fileId: string; mediaType: string } | undefined {
+  if (msg.photo?.length) {
+    const photo = [...msg.photo].reverse().find((p) => (p.file_size ?? 0) <= MAX_IMAGE_BYTES);
+    return photo ? { fileId: photo.file_id, mediaType: 'image/jpeg' } : undefined;
+  }
+  const doc = msg.document;
+  if (doc?.mime_type && VISION_TYPES.has(doc.mime_type) && (doc.file_size ?? 0) <= MAX_IMAGE_BYTES) {
+    return { fileId: doc.file_id, mediaType: doc.mime_type };
+  }
+  return undefined;
+}
+
+/** Any other file in a message (document, video, audio, voice note), so it can be fetched later. */
+function fileOf(msg: Message): { fileId: string; mediaType: string; fileName: string; size?: number } | undefined {
+  const file: { file_id: string; file_name?: string; mime_type?: string; file_size?: number } | undefined =
+    msg.document ??
+    (msg.video && { ...msg.video, file_name: msg.video.file_name ?? 'video.mp4' }) ??
+    (msg.animation && { ...msg.animation, file_name: msg.animation.file_name ?? 'animation.mp4' }) ??
+    (msg.audio && { ...msg.audio, file_name: msg.audio.file_name ?? 'audio.mp3' }) ??
+    (msg.voice && { ...msg.voice, file_name: 'voice.ogg' }) ??
+    (msg.video_note && { ...msg.video_note, file_name: 'video_note.mp4' });
+  if (!file) return undefined;
+  return {
+    fileId: file.file_id,
+    mediaType: file.mime_type ?? 'application/octet-stream',
+    fileName: (file.file_name ?? 'file').replace(/[^\w.\-]+/g, '_').slice(-100),
+    ...(file.file_size ? { size: file.file_size } : {}),
+  };
+}
+
 interface Recorded {
   topic?: string;
   /** When this person last wrote before the current message. */
@@ -291,6 +414,8 @@ function record(msg: Message, edited: boolean): Recorded {
   const topic = topicOf(msg);
   const date = new Date((edited && msg.edit_date ? msg.edit_date : msg.date) * 1000);
   appendTranscript(msg.chat.id, date, formatMessageBody(msg, { edited }), topic);
+  const media = pictureOf(msg) ?? fileOf(msg);
+  if (media) recordMedia(msg.chat.id, { msg: msg.message_id, ...media });
 
   let previousMessageAt: Date | undefined;
   if (!edited && msg.from && !msg.from.is_bot && !msg.sender_chat) {
@@ -308,14 +433,76 @@ function recordBotMessage(me: BotFullInfo, sent: Message, text: string, context:
 /** Lets the secretary post a file from its workspace into the conversation it is answering. */
 function fileSender(api: Api, me: BotFullInfo, target: Target, topic: string | undefined) {
   return async (data: Buffer, fileName: string, caption?: string): Promise<void> => {
-    const sent = await api.sendDocument(target.chatId, new InputFile(data, fileName), {
+    const options = {
       caption,
       message_thread_id: target.threadId,
       ...(target.replyTo
         ? { reply_parameters: { message_id: target.replyTo, allow_sending_without_reply: true } }
         : {}),
-    });
+    };
+    // Pictures go out as photos, shown inline in the chat; anything else (or a picture
+    // Telegram will not take as a photo) as a file.
+    if (PHOTO_FILE.test(fileName) && data.length <= MAX_PHOTO_UPLOAD_BYTES) {
+      try {
+        const sent = await api.sendPhoto(target.chatId, new InputFile(data, fileName), options);
+        recordBotMessage(me, sent, `[photo]${caption ? ` ${caption}` : ''}`, 'sent a photo', topic);
+        return;
+      } catch (error) {
+        if (!(error instanceof GrammyError) || error.error_code !== 400) throw error;
+      }
+    }
+    const sent = await api.sendDocument(target.chatId, new InputFile(data, fileName), options);
     recordBotMessage(me, sent, `[file: ${fileName}]${caption ? ` ${caption}` : ''}`, 'sent a file', topic);
+  };
+}
+
+/** Lets the secretary look at a picture posted earlier in the group, by its message number. */
+function imageViewer(api: Api, chatId: number) {
+  return async (messageId: number): Promise<ImageAttachment | undefined> => {
+    const media = findMedia(chatId, messageId);
+    if (!media || !VISION_TYPES.has(media.mediaType)) return undefined;
+    const data = await downloadTelegramFile(api, media.fileId, MAX_IMAGE_BYTES);
+    return data ? { data: data.toString('base64'), mediaType: media.mediaType } : undefined;
+  };
+}
+
+/** Polls the bot sent, by poll id, so a vote (which names no chat) can be routed to the group's hooks. */
+const pollChats = new Map<string, { chatId: number; topic?: string }>();
+
+/**
+ * Calls any Telegram Bot API method for one group (rights are checked by the caller), writes what it
+ * sent to the record, and remembers polls so their votes reach the hooks.
+ */
+function telegramCaller(api: Api, me: BotFullInfo, chatId: number, threadId: number | undefined, topic: string | undefined, label: string) {
+  return async (method: string, params: Record<string, unknown>): Promise<unknown> => {
+    const payload = await prepareCall(method, params, { chatId, threadId }, (file) => readSandboxFile(chatId, sandboxUidFor(chatId), file));
+    const result = await callTelegram(api, method, payload);
+    for (const sent of sentMessages(result)) {
+      const poll = (sent as { poll?: { id: string; question: string } }).poll;
+      if (poll) {
+        if (pollChats.size > 1000) pollChats.clear();
+        pollChats.set(poll.id, { chatId, topic });
+      }
+      const body = sent.text ?? sent.caption ?? (poll ? `[poll] ${poll.question}` : `[${method.replace(/^send/, '').toLowerCase() || method}]`);
+      if (sent.chat?.id === chatId && method !== 'forwardMessage') recordBotMessage(me, sent as unknown as Message, body, `${label} via ${method}`, topic);
+    }
+    console.log(`[Telegram] ${chatId} ${label}: ${method}`);
+    return result;
+  };
+}
+
+/** Lets the secretary fetch any file or picture posted earlier into its workspace, by message number. */
+function fileFetcher(api: Api, group: GroupState) {
+  return async (messageId: number): Promise<string> => {
+    const media = findMedia(group.chatId, messageId);
+    if (!media) throw new Error(`No file or picture is on record for msg ${messageId} (only those posted since this feature was added are).`);
+    if ((media.size ?? 0) > MAX_DOWNLOAD_BYTES) throw new Error('That file is over 20 MB, and Telegram does not let bots download it.');
+    const data = await downloadTelegramFile(api, media.fileId, MAX_DOWNLOAD_BYTES);
+    if (!data) throw new Error('The file could not be downloaded (bots can only fetch files up to 20 MB).');
+    const name = media.fileName ?? (media.mediaType === 'image/jpeg' ? 'photo.jpg' : `image.${media.mediaType.split('/')[1] ?? 'bin'}`);
+    const saved = `inbox/${messageId}_${name}`;
+    await uploadToSandbox(group.chatId, sandboxUidFor(group.chatId), saved, data);
+    return saved;
   };
 }
 
@@ -338,7 +525,7 @@ interface Ask {
 interface PendingAnswer {
   msg: Message;
   topic?: string;
-  ask: { question: string; ignoreReply?: boolean; previousMessageAt?: string };
+  ask: { question: string; ignoreReply?: boolean; previousMessageAt?: string; viaHook?: string };
   startedAt: string;
   attempts: number;
 }
@@ -359,7 +546,13 @@ function savePending(msg: Message, topic: string | undefined, ask: Ask, attempts
     const pending: PendingAnswer = {
       msg,
       topic,
-      ask: { question: ask.question, ignoreReply: ask.ignoreReply, previousMessageAt: ask.previousMessageAt?.toISOString() },
+      ask: {
+        question: ask.question,
+        ignoreReply: ask.ignoreReply,
+        previousMessageAt: ask.previousMessageAt?.toISOString(),
+        // A hook-originated answer resumed after a restart must stay rights-free.
+        viaHook: ask.viaHook,
+      },
       startedAt: new Date().toISOString(),
       attempts,
     };
@@ -428,7 +621,8 @@ async function answer(
   attempt = 1,
 ): Promise<void> {
   const chatId = msg.chat.id;
-  const target = targetOf(msg);
+  const { target, moved } = answerTargetOf(group, msg);
+  const answerTopic = moved && topic !== undefined ? topicNameOf(chatId, target.threadId) : topic;
   inFlight++;
   savePending(msg, topic, ask, attempt);
   const stopTyping = startTyping(api, target);
@@ -465,21 +659,35 @@ async function answer(
           group,
           botName: config.BOT_NAME,
           asker: senderLabel(senderOf(msg)),
+          // A hook-originated run never carries the rights of whoever wrote the message.
+          askerId: ask.viaHook ? undefined : msg.from?.id,
           question,
           topic,
           threadId: target.threadId,
           repliedTo: replied ? `[${localTime(new Date(replied.date * 1000)).stamp}] ${formatMessageBody(replied)}` : undefined,
           images: attachments.images.length ? attachments.images : undefined,
-          sendFile: fileSender(api, me, target, topic),
+          sendFile: fileSender(api, me, target, answerTopic),
+          viewImage: imageViewer(api, chatId),
+          fetchFile: sandboxEnabled() ? fileFetcher(api, group) : undefined,
+          telegramCall: telegramCaller(api, me, chatId, target.threadId, answerTopic, `asked by ${senderOf(msg).name}`),
         },
         entry.controller,
       ),
     );
 
     stopTyping();
-    const sent = await sendFormatted(api, target, result.text);
+    // In another topic: a real reply if Telegram allows it, otherwise a line linking to the question.
+    let sent = moved && result.text ? await sendAcrossTopics(api, target, msg, result.text) : undefined;
+    if (!sent && result.text) {
+      const linkBase = messageLinkBase(group);
+      const origin = `${senderOf(msg).name}, #${topic ?? GENERAL_TOPIC}`;
+      const text = moved
+        ? `↪️ ${linkBase ? `[${origin}](${linkBase}/${msg.message_id})` : origin}\n${result.text}`
+        : result.text;
+      sent = await sendFormatted(api, target, text);
+    }
     if (sent) {
-      recordBotMessage(me, sent, result.text, `reply to msg ${msg.message_id} by ${senderOf(msg).name}`, topic);
+      recordBotMessage(me, sent, result.text, `reply to msg ${msg.message_id} by ${senderOf(msg).name}`, answerTopic);
     }
 
     noteAnswerOutcome(api, true);
@@ -540,6 +748,30 @@ function answerInBackground(
 }
 
 /**
+ * Announce finished deploys in the chat that asked for them. The host writes the
+ * result; this checks for it now (after a restart) and then every 20 seconds
+ * (a failed build leaves the bot running, so there is no restart to wait for).
+ */
+export function startDeployWatcher(api: Api, me: BotFullInfo): void {
+  if (!deployEnabled()) return;
+  const check = async () => {
+    const result = takeDeployResult();
+    if (!result) return;
+    const text = result.ok
+      ? `✅ Deployed ${result.sha.slice(0, 7)}${result.previous ? ` (was ${result.previous.slice(0, 7)})` : ''}. ${result.message}`.trim()
+      : `❌ Deploy of ${result.sha.slice(0, 7)} failed, still running ${result.previous?.slice(0, 7) ?? 'the previous version'}.\n${result.message}`;
+    try {
+      const sent = await sendPlain(api, { chatId: result.chatId, threadId: result.threadId }, text);
+      if (getGroup(result.chatId)?.enabled) recordBotMessage(me, sent, text, 'deploy', result.threadId ? topicNameOf(result.chatId, result.threadId) : undefined);
+    } catch (error) {
+      console.warn('[Deploy] Could not post the result:', (error as Error).message);
+    }
+  };
+  void check();
+  setInterval(() => void check(), 20_000).unref();
+}
+
+/**
  * Pick up questions that were cut off by a restart or crash. Called once at startup.
  * A question is retried once, and only while it is recent enough to still be wanted.
  */
@@ -570,6 +802,7 @@ export function resumePendingAnswers(api: Api, me: BotFullInfo): number {
         pending.topic,
         {
           question: pending.ask.question,
+          viaHook: pending.ask.viaHook,
           ignoreReply: pending.ask.ignoreReply,
           previousMessageAt: pending.ask.previousMessageAt ? new Date(pending.ask.previousMessageAt) : undefined,
         },
@@ -631,18 +864,43 @@ async function applyHookActions(
             if (sent) recordBotMessage(me, sent, action.text, `hook ${hook.name}`, topic);
             break;
           }
+          case 'photo': {
+            const options = {
+              message_thread_id: target.threadId,
+              ...(action.caption ? { caption: action.caption } : {}),
+              ...(action.reply ? { reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true } } : {}),
+            };
+            // A URL is fetched by Telegram's servers, never by the bot itself; a workspace
+            // file comes out of the sandbox the same way send_file does.
+            const sent = await api.sendPhoto(chatId, await photoSource(chatId, action), options);
+            const context = action.reply ? `hook ${hook.name}, reply to msg ${msg.message_id}` : `hook ${hook.name}`;
+            recordBotMessage(me, sent, `[photo]${action.caption ? ` ${action.caption}` : ''}`, context, topic);
+            break;
+          }
           case 'react':
             await api.setMessageReaction(chatId, msg.message_id, [{ type: 'emoji', emoji: action.emoji as never }]);
             break;
-          case 'delete':
-            await api.deleteMessage(chatId, msg.message_id);
-            appendTranscript(chatId, new Date(), `* msg ${msg.message_id} from ${senderOf(msg).name} was removed by the hook "${hook.name}"`, topic);
+          case 'delete': {
+            // An earlier message can be deleted too (Telegram allows it for 48 hours), so a
+            // hook can keep a list of message ids and clean them up later.
+            const id = action.message_id ?? msg.message_id;
+            await api.deleteMessage(chatId, id);
+            const who = id === msg.message_id ? ` from ${senderOf(msg).name}` : '';
+            appendTranscript(chatId, new Date(), `* msg ${id}${who} was removed by the hook "${hook.name}"`, topic);
             break;
+          }
           case 'pin':
-            await api.pinChatMessage(chatId, msg.message_id, { disable_notification: true });
+            await api.pinChatMessage(chatId, action.message_id ?? msg.message_id, { disable_notification: true });
             break;
           case 'note':
             appendNote(chatId, action.text, `hook ${hook.name}`);
+            break;
+          case 'api':
+            if (methodLevel(action.method) !== 'open') {
+              console.warn(`[Hooks] ${chatId}: "${hook.name}" may not call ${action.method} (owner or manager only)`);
+              break;
+            }
+            await telegramCaller(api, me, chatId, target.threadId, topic, `hook ${hook.name}`)(action.method, action.params);
             break;
           case 'ask':
             if (!allow(hookAskTimes, chatId, config.SECRETARY_HOOK_ASKS_PER_HOUR, 3_600_000)) {
@@ -660,6 +918,75 @@ async function applyHookActions(
       } catch (error) {
         console.warn(`[Hooks] ${chatId}: "${hook.name}" could not ${action.do}:`, (error as Error).message);
       }
+    }
+  }
+}
+
+/** A photo action's picture: a URL Telegram fetches itself, or a file read out of the workspace. */
+async function photoSource(chatId: number, action: { url?: string; file?: string }): Promise<string | InputFile> {
+  if (action.url) return action.url;
+  return new InputFile(await readSandboxFile(chatId, sandboxUidFor(chatId), action.file!), action.file!.split('/').pop());
+}
+
+/**
+ * Actions printed by a scheduled script ({"actions": [...]}, the same format as a hook's).
+ * There is no incoming message here, so "reply" posts like "send", delete and pin need a
+ * message_id, and react and ask are skipped.
+ */
+async function applyEventActions(
+  api: Api,
+  me: BotFullInfo,
+  chatId: number,
+  target: Target,
+  topic: string | undefined,
+  label: string,
+  actions: HookAction[],
+): Promise<void> {
+  const schedule = { topic };
+  for (const action of actions) {
+    if (!allow(hookActionTimes, chatId, HOOK_ACTIONS_PER_MINUTE, 60_000)) {
+      console.warn(`[Schedule] ${chatId}: more than ${HOOK_ACTIONS_PER_MINUTE} actions in a minute, skipping the rest`);
+      return;
+    }
+    try {
+      switch (action.do) {
+        case 'reply':
+        case 'send': {
+          const sent = await sendFormatted(api, target, action.text);
+          if (sent) recordBotMessage(me, sent, action.text, label, schedule.topic);
+          break;
+        }
+        case 'photo': {
+          const sent = await api.sendPhoto(chatId, await photoSource(chatId, action), {
+            message_thread_id: target.threadId,
+            ...(action.caption ? { caption: action.caption } : {}),
+          });
+          recordBotMessage(me, sent, `[photo]${action.caption ? ` ${action.caption}` : ''}`, label, schedule.topic);
+          break;
+        }
+        case 'delete':
+          if (action.message_id === undefined) break;
+          await api.deleteMessage(chatId, action.message_id);
+          appendTranscript(chatId, new Date(), `* msg ${action.message_id} was removed by ${label}`, schedule.topic);
+          break;
+        case 'pin':
+          if (action.message_id !== undefined) await api.pinChatMessage(chatId, action.message_id, { disable_notification: true });
+          break;
+        case 'note':
+          appendNote(chatId, action.text, label);
+          break;
+        case 'api':
+          if (methodLevel(action.method) !== 'open') {
+            console.warn(`[Actions] ${chatId}: ${label} may not call ${action.method} (owner or manager only)`);
+            break;
+          }
+          await telegramCaller(api, me, chatId, target.threadId, topic, label)(action.method, action.params);
+          break;
+        default:
+          break;
+      }
+    } catch (error) {
+      console.warn(`[Actions] ${chatId}: ${label} could not ${action.do}:`, (error as Error).message);
     }
   }
 }
@@ -729,7 +1056,18 @@ export function createScheduleDeliverer(api: Api, me: BotFullInfo) {
         await post(`⚠️ The scheduled script ${file} (${schedule.id}) failed: ${why.slice(0, 300)}`).catch(() => {});
         return;
       }
-      if (output) {
+      // A script may print actions instead of a message.
+      let actions: HookAction[] = [];
+      if (/^[[{]/.test(output)) {
+        try {
+          actions = parseActions(output);
+        } catch {
+          actions = [];
+        }
+      }
+      if (actions.length) {
+        await applyEventActions(api, me, chatId, target, schedule.topic, `scheduled script ${schedule.id}`, actions);
+      } else if (output) {
         const text = output.slice(0, 12_000);
         const sent = await post(text);
         if (sent) recordBotMessage(me, sent, text, `scheduled script ${schedule.id} (${file})`, schedule.topic);
@@ -752,10 +1090,13 @@ export function createScheduleDeliverer(api: Api, me: BotFullInfo) {
           scheduled: true,
           effort: schedule.effort,
           sendFile: fileSender(api, me, target, schedule.topic),
+          viewImage: imageViewer(api, chatId),
+          fetchFile: sandboxEnabled() ? fileFetcher(api, group) : undefined,
+          telegramCall: telegramCaller(api, me, chatId, target.threadId, schedule.topic, `scheduled task ${schedule.id}`),
         }),
       );
       stopTyping();
-      const sent = await post(result.text);
+      const sent = result.text ? await post(result.text) : undefined;
       if (sent) recordBotMessage(me, sent, result.text, `scheduled task ${schedule.id} set by ${schedule.createdBy}`, schedule.topic);
       logUsage(chatId, {
         t: new Date().toISOString(),
@@ -791,6 +1132,7 @@ function helpText(me: BotFullInfo): string {
     '• /usage [days] — who used how much Claude',
     '• /stop — stop the answer I am working on',
     '• /status — what I am recording',
+    '• /settings — where I answer, model, house rules, managers; the owner or a manager changes them by asking me',
     '',
     'Things you can ask me to do:',
     '• "Remember that the AGM moved to 20 Dec" — I keep notes',
@@ -801,7 +1143,11 @@ function helpText(me: BotFullInfo): string {
     lines.push('• Reply to a PDF, Word or Excel file and mention me to have it read');
     lines.push('• "Make a hook that deletes messages containing X", "Run this script every 10 minutes" — automation without asking each time');
   }
-  lines.push('', 'Admins: /welcome <text> sets a greeting for new members. Owner: /effort <level>, /enable, /disable, /forget.');
+  lines.push(
+    '',
+    'Admins: /welcome <text> sets a greeting for new members. ' +
+      'Owner or managers: /effort <level>, /model <name>, /answerhere (send all answers to this topic). Owner: /enable, /disable, /forget.',
+  );
   return lines.join('\n');
 }
 
@@ -873,6 +1219,12 @@ async function handleGroupCommand(
   const group = getGroup(chatId);
   if (Date.now() / 1000 - msg.date > ANSWER_MAX_AGE_SECONDS) return;
 
+  /** Reply to the command, and keep the reply in the record so the secretary can refer to it later. */
+  const say = async (text: string): Promise<void> => {
+    const sent = await sendPlain(api, target, text);
+    recordBotMessage(ctx.me, sent, text, `reply to /${command} by ${senderOf(msg).name}`, recorded.topic);
+  };
+
   if (command === 'enable') {
     await handleEnable(ctx, msg);
     return;
@@ -884,20 +1236,20 @@ async function handleGroupCommand(
   switch (command) {
     case 'disable':
       if (!isOwner(msg.from?.id)) {
-        await sendPlain(api, target, "Only the bot's owner can turn the secretary off.");
+        await say("Only the bot's owner can turn the secretary off.");
         return;
       }
       disableGroup(chatId);
-      await sendPlain(api, target, '📕 Secretary mode is off. I have stopped recording and reminders are paused; the existing record is kept. /enable turns me back on, /forget erases the record.');
+      await say('📕 Secretary mode is off. I have stopped recording and reminders are paused; the existing record is kept. /enable turns me back on, /forget erases the record.');
       return;
 
     case 'forget':
       if (!isOwner(msg.from?.id)) {
-        await sendPlain(api, target, "Only the bot's owner can erase the record.");
+        await say("Only the bot's owner can erase the record.");
         return;
       }
       if (args.toLowerCase() !== 'confirm') {
-        await sendPlain(api, target, 'This permanently deletes everything I have for this group: the record, notes, reminders and workspace files. Send "/forget confirm" to go ahead.');
+        await say('This permanently deletes everything I have for this group: the record, notes, reminders and workspace files. Send "/forget confirm" to go ahead.');
         return;
       }
       if (sandboxEnabled() && group.sandboxUid !== undefined) {
@@ -908,19 +1260,19 @@ async function handleGroupCommand(
       deleteGroupData(chatId);
       forgetSchedules(chatId);
       forgetHooks(chatId);
+      forgetSecrets(chatId);
+      forgetMcpServers(chatId);
       removeGroup(chatId);
-      await sendPlain(api, target, '🗑 Everything I had for this group has been erased and recording is off.');
+      await say('🗑 Everything I had for this group has been erased and recording is off.');
       return;
 
     case 'welcome': {
       if (!(await isAdminOrOwner(ctx, msg))) {
-        await sendPlain(api, target, 'Only group admins can set the welcome message.');
+        await say('Only group admins can set the welcome message.');
         return;
       }
       if (!args) {
-        await sendPlain(
-          api,
-          target,
+        await say(
           group.welcome
             ? `Current welcome message:\n\n${group.welcome}\n\nChange it with /welcome <text>, or turn it off with /welcome off.`
             : 'No welcome message is set. Use /welcome <text>; {name} is replaced with the new member\'s name and {group} with the group name.',
@@ -929,25 +1281,35 @@ async function handleGroupCommand(
       }
       if (args.toLowerCase() === 'off') {
         setWelcome(chatId, undefined);
-        await sendPlain(api, target, 'Welcome message turned off.');
+        await say('Welcome message turned off.');
         return;
       }
       setWelcome(chatId, args.slice(0, 1500));
-      await sendPlain(api, target, 'Welcome message saved. New members will be greeted with it.');
+      await say('Welcome message saved. New members will be greeted with it.');
       return;
     }
 
     case 'hooks': {
       const [verb, name] = args.split(/\s+/);
       if ((verb === 'on' || verb === 'off') && name) {
-        const hook = setHookEnabled(chatId, name, verb === 'on');
-        await sendPlain(api, target, hook ? `Hook "${hook.name}" is now ${verb}.` : `There is no hook named "${name}".`);
+        const existing = listHooks(chatId).find((h) => h.name === name.toLowerCase());
+        if (!existing) {
+          await say(`There is no hook named "${name}".`);
+          return;
+        }
+        // The person who made a hook, group admins and the owner may switch it.
+        const allowed =
+          existing.createdBy === senderLabel(senderOf(msg)) || canManage(group, msg.from?.id) || (await isAdminOrOwner(ctx, msg));
+        if (!allowed) {
+          await say(`Only ${existing.createdBy}, a group admin, the bot's owner or a manager can switch "${existing.name}" ${verb}.`);
+          return;
+        }
+        setHookEnabled(chatId, existing.name, verb === 'on');
+        await say(`Hook "${existing.name}" is now ${verb}.`);
         return;
       }
       const hooks = listHooks(chatId);
-      await sendPlain(
-        api,
-        target,
+      await say(
         hooks.length
           ? `Hooks (scripts that react to messages):\n\n${hooks.map((h) => `• ${describeHook(h)}`).join('\n')}\n\n/hooks off <name> or /hooks on <name> switches one. Ask me to change or remove one.`
           : 'No hooks yet. Ask me for one, e.g. "make a hook that reacts with 🔥 whenever someone posts a GitHub link".',
@@ -957,7 +1319,7 @@ async function handleGroupCommand(
 
     case 'usage': {
       const days = Math.min(Math.max(parseInt(args, 10) || 7, 1), 365);
-      await sendPlain(api, target, formatUsage(chatId, days));
+      await say(formatUsage(chatId, days));
       return;
     }
 
@@ -966,44 +1328,192 @@ async function handleGroupCommand(
       const levels = EFFORT_LEVELS.join(', ');
       const wanted = args.toLowerCase();
       if (!wanted) {
-        await sendPlain(
-          api,
-          target,
+        await say(
           `Effort is ${current}${group.effort ? '' : ' (the default)'}. Levels: ${levels}. ` +
             'Higher means more thinking and checking per answer: better on hard questions, slower, and it uses more of the Claude plan. ' +
-            'The owner can change it with /effort <level>, or /effort default.',
+            'The owner or a manager can change it with /effort <level>, or /effort default.',
         );
         return;
       }
-      if (!isOwner(msg.from?.id)) {
-        await sendPlain(api, target, "Only the bot's owner can change the effort level.");
+      if (!canManage(group, msg.from?.id)) {
+        await say("Only the bot's owner or a manager can change the effort level.");
         return;
       }
       if (wanted === 'default') {
         setGroupEffort(chatId, undefined);
-        await sendPlain(api, target, `Effort is back to the default (${config.SECRETARY_EFFORT}).`);
+        await say(`Effort is back to the default (${config.SECRETARY_EFFORT}).`);
         return;
       }
       if (!(EFFORT_LEVELS as readonly string[]).includes(wanted)) {
-        await sendPlain(api, target, `"${args}" is not a level. Use one of: ${levels}, or default.`);
+        await say(`"${args}" is not a level. Use one of: ${levels}, or default.`);
         return;
       }
       setGroupEffort(chatId, wanted as EffortLevel);
-      await sendPlain(api, target, `Effort set to ${wanted} for this group (was ${current}). It applies from the next question.`);
+      await say(`Effort set to ${wanted} for this group (was ${current}). It applies from the next question.`);
       return;
     }
+
+    case 'model': {
+      const current = group.model ?? 'default';
+      const names = Object.keys(MODEL_CHOICES).join(', ');
+      const wanted = args.trim();
+      if (!wanted) {
+        await say(
+          `Model: ${group.model ?? `the default (${config.SECRETARY_MODEL || config.CLAUDE_MODEL})`}. ` +
+            `Choices: ${names}, or any claude-... model id. Bigger models answer harder questions better but cost more per answer (see /usage). ` +
+            'The owner or a manager can change it with /model <name>, or /model default.',
+        );
+        return;
+      }
+      if (!canManage(group, msg.from?.id)) {
+        await say("Only the bot's owner or a manager can change the model.");
+        return;
+      }
+      if (wanted.toLowerCase() === 'default') {
+        setGroupModel(chatId, undefined);
+        await say(`Model is back to the default (${config.SECRETARY_MODEL || config.CLAUDE_MODEL}).`);
+        return;
+      }
+      const model = resolveModel(wanted);
+      if (!model) {
+        await say(`"${wanted}" is not a Claude model. Use one of: ${names}, a full claude-... id, or default.`);
+        return;
+      }
+      setGroupModel(chatId, model);
+      await say(`Model set to ${model} for this group (was ${current}). It applies from the next question.`);
+      return;
+    }
+
+    case 'answerhere': {
+      if (!isForum(msg)) {
+        await say('This only works in groups with topics.');
+        return;
+      }
+      if (!canManage(group, msg.from?.id)) {
+        await say("Only the bot's owner or a manager can choose where answers go.");
+        return;
+      }
+      if (args.toLowerCase() === 'off') {
+        setAnswerTopic(chatId, undefined);
+        await say('Answers go back to the topic each question was asked in.');
+        return;
+      }
+      const here = threadIdOf(msg);
+      setAnswerTopic(chatId, here ?? 0);
+      await say(
+        `From now on every answer is posted in #${topicNameOf(chatId, here)}, with a link back to the question. ` +
+          'Command replies and hook messages stay where they happen. /answerhere off undoes this.',
+      );
+      return;
+    }
+
+    case 'manager':
+    case 'managers': {
+      const [verb, ...who] = args.split(/\s+/);
+      const query = who.join(' ');
+      if (!['add', 'remove'].includes(verb?.toLowerCase()) || !query) {
+        await say(
+          `${describeSettings(group).split('\n').find((line) => line.startsWith('Owner:'))}\n\n` +
+            'The owner adds or removes a manager with /manager add @username or /manager remove @username. ' +
+            "Managers can change this group's settings, secrets and hooks by asking me.",
+        );
+        return;
+      }
+      if (!isOwner(msg.from?.id)) {
+        await say("Only the bot's owner can add or remove managers.");
+        return;
+      }
+      const member = findMember(chatId, query);
+      if (!member) {
+        await say(`No member called "${query}" has written in this group yet.`);
+        return;
+      }
+      const managers = new Set(group.managers ?? []);
+      if (verb.toLowerCase() === 'add') managers.add(member.id);
+      else managers.delete(member.id);
+      updateGroupSettings(chatId, { managers: [...managers] });
+      await say(`${member.name} is ${verb.toLowerCase() === 'add' ? 'now a manager' : 'no longer a manager'} of this group.`);
+      return;
+    }
+
+    case 'machine': {
+      if (!sandboxEnabled() || config.SANDBOX_BACKEND !== 'workbench') {
+        await say("This group's workspace is not its own machine on this server (SANDBOX_BACKEND is not workbench).");
+        return;
+      }
+      const wanted = args.toLowerCase();
+      if (wanted === 'reset' && !canManage(group, msg.from?.id)) {
+        await say("Only the bot's owner or a manager can reset the machine.");
+        return;
+      }
+      try {
+        const info = await sandboxMachineAction(chatId, sandboxUidFor(chatId), wanted === 'reset' ? 'reset' : 'status');
+        const lines = Object.entries(info)
+          .filter(([, v]) => v !== undefined && v !== null && v !== '')
+          .map(([k, v]) => `• ${k}: ${typeof v === 'object' ? JSON.stringify(v) : String(v)}`);
+        await say(
+          (wanted === 'reset' ? 'Machine reset: it is rebuilt fresh on the next command (files in the workspace stay, ~/.setup.sh runs again).\n' : '') +
+            (lines.join('\n') || 'No details.') +
+            (wanted === 'reset' ? '' : '\n\n/machine reset (owner or manager) rebuilds it from a clean image; workspace files stay.'),
+        );
+      } catch (error) {
+        await say(`Could not reach the machine: ${(error as Error).message}`);
+      }
+      return;
+    }
+
+    case 'version': {
+      const version = currentVersion();
+      await say(
+        version
+          ? `Running ${version.sha.slice(0, 7)}${version.deployedAt ? `, deployed ${version.deployedAt.slice(0, 16).replace('T', ' ')} UTC` : ''}.`
+          : "I don't know which version is running (it was not deployed from the chat).",
+      );
+      return;
+    }
+
+    case 'deploy': {
+      if (!deployEnabled()) {
+        await say('Deploying from the chat is not set up on this server (DEPLOY_FROM_CHAT and the host deployer).');
+        return;
+      }
+      if (!isOwner(msg.from?.id)) {
+        await say("Only the bot's owner can deploy.");
+        return;
+      }
+      const [verb, sha] = args.split(/\s+/);
+      if (verb?.toLowerCase() === 'confirm') {
+        const problem = confirmDeploy(chatId, sha ?? '', senderLabel(senderOf(msg)), threadIdOf(msg));
+        await say(problem ?? `🚀 Deploying ${sha}. I'll be back in a minute or two and post the result here.`);
+        return;
+      }
+      try {
+        await say(describePlan(await planDeploy(chatId, verb || 'main')));
+      } catch (error) {
+        await say(`Could not look that up: ${(error as Error).message}`);
+      }
+      return;
+    }
+
+    case 'settings':
+      await say(
+        `Settings for this group:\n${describeSettings(group)}\n\n` +
+          'The owner or a manager can change any of these by asking me, e.g. "send all answers to #bot", ' +
+          '"answer everyone in English", "use sonnet". The owner names managers with /manager add @username.',
+      );
+      return;
 
     case 'status': {
       const stats = transcriptStats(chatId);
       const topics = group.isForum ? ` · ${listTopicNames(chatId).length + 1} topics known` : '';
       const schedules = listSchedules(chatId).length;
-      await sendPlain(
-        api,
-        target,
+      await say(
         `📒 Recording "${group.title}" since ${stats.firstDay ?? 'today'} · ${stats.days} day(s) on file (${formatBytes(stats.bytes)})${topics}` +
           ` · ${schedules} reminder(s)/task(s) · workspace ${sandboxEnabled() ? 'on' : 'off'}` +
           ` · ${listHooks(chatId).filter((h) => h.enabled).length} hook(s) on` +
           ` · effort ${group.effort ?? config.SECRETARY_EFFORT}` +
+          ` · model ${group.model ?? 'default'}` +
+          (group.answerTopic !== undefined ? ` · answers go to #${topicNameOf(chatId, group.answerTopic || undefined)}` : '') +
           (await privacyWarning(ctx, chatId)),
       );
       return;
@@ -1011,9 +1521,7 @@ async function handleGroupCommand(
 
     case 'reminders': {
       const schedules = listSchedules(chatId);
-      await sendPlain(
-        api,
-        target,
+      await say(
         schedules.length
           ? `Reminders and tasks:\n\n${schedules.map((s) => `• ${describeSchedule(s)}`).join('\n')}\n\nAsk me to cancel one by its id.`
           : 'Nothing is scheduled. Ask me, e.g. "remind us on Friday at 6pm to bring the banner".',
@@ -1026,7 +1534,7 @@ async function handleGroupCommand(
       const all = await isAdminOrOwner(ctx, msg);
       const mine = active.filter((entry) => all || entry.userId === msg.from?.id);
       if (!mine.length) {
-        await sendPlain(api, target, active.length ? 'You can only stop your own question.' : 'Nothing is running.');
+        await say(active.length ? 'You can only stop your own question.' : 'Nothing is running.');
         return;
       }
       for (const entry of mine) entry.controller.abort();
@@ -1035,12 +1543,12 @@ async function handleGroupCommand(
 
     case 'help':
     case 'start':
-      await sendPlain(api, target, helpText(ctx.me));
+      await say(helpText(ctx.me));
       return;
 
     case 'ask':
       if (!args) {
-        await sendPlain(api, target, 'Ask me something, e.g. "/ask what did we decide about the venue?"');
+        await say('Ask me something, e.g. "/ask what did we decide about the venue?"');
         return;
       }
       answerInBackground(api, ctx.me, group, msg, recorded.topic, { question: args, previousMessageAt: recorded.previousMessageAt });
@@ -1115,6 +1623,91 @@ async function handleGroups(ctx: Context): Promise<void> {
   await ctx.reply(`Groups:\n${lines.join('\n')}`);
 }
 
+// ── Secrets ──────────────────────────────────────────────────────────
+
+const SECRET_COMMAND = /^\/(secrets?)(?:@(\w+))?(?:\s+([\s\S]*))?$/i;
+
+/** A /secret command meant for this bot (it may hold a key, so it is handled before anything else sees it). */
+function secretCommandOf(msg: Message, botUsername: string | undefined): { args: string } | undefined {
+  const match = (msg.text ?? '').trim().match(SECRET_COMMAND);
+  if (!match) return undefined;
+  if (match[2] && match[2].toLowerCase() !== (botUsername ?? '').toLowerCase()) return undefined;
+  return { args: (match[3] ?? '').trim() };
+}
+
+/** Carry out /secret for one group and return the reply. Never echoes a value. */
+function applySecretCommand(group: GroupState, userId: number | undefined, who: string, args: string): string {
+  const names = () => {
+    const list = listSecrets(group.chatId);
+    return list.length
+      ? `Secrets for "${group.title}" (available to my workspace as environment variables):\n${list.map((s) => `• ${s.name}, set by ${s.setBy} on ${s.setAt.slice(0, 10)}`).join('\n')}`
+      : `No secrets are set for "${group.title}".`;
+  };
+  if (!args) {
+    return `${names()}\n\nThe owner or a manager adds one with /secret NAME value (best in a private chat with me) and removes it with /secret unset NAME.`;
+  }
+  if (!canManage(group, userId)) {
+    return "Only the bot's owner or a manager of this group can set secrets. If that was a real key, revoke it: I deleted the message, but people may have seen it.";
+  }
+  const [first, second, ...rest] = args.split(/\s+/);
+  if (first.toLowerCase() === 'unset' && second) {
+    return removeSecret(group.chatId, second) ? `Removed ${second}.` : `There is no secret called ${second}.`;
+  }
+  const value = [second, ...rest].join(' ').trim();
+  if (!value) return 'Use /secret NAME value, e.g. /secret AGENTMAIL_API_KEY am_us_...';
+  try {
+    setSecret(group.chatId, first, value, who);
+  } catch (error) {
+    return (error as Error).message;
+  }
+  return (
+    `🔑 Saved ${first} for "${group.title}". Commands, hooks and scripts in my workspace can use it as $${first}. ` +
+    'Anyone who can ask me to run commands can use it too, so only add keys the whole group may use.'
+  );
+}
+
+/** /secret sent in the group: remove the message, keep it out of the record, then act on it. */
+async function handleSecretInGroup(ctx: Context, group: GroupState | undefined, msg: Message, args: string): Promise<void> {
+  const deleted = await ctx.api.deleteMessage(msg.chat.id, msg.message_id).then(
+    () => true,
+    (error) => {
+      console.warn(`[Secretary] Could not delete a /secret message in ${msg.chat.id}:`, (error as Error).message);
+      return false;
+    },
+  );
+  if (!group) return;
+  const topic = topicOf(msg);
+  appendTranscript(msg.chat.id, new Date(msg.date * 1000), `* ${senderOf(msg).name} sent /secret (kept out of the record)`, topic);
+  const warning =
+    args && !deleted ? "\n\n⚠️ I couldn't delete your message (I need to be an admin who can delete messages), so delete it yourself and treat the key as seen." : '';
+  const text = applySecretCommand(group, msg.from?.id, senderLabel(senderOf(msg)), args) + warning;
+  const sent = await sendPlain(ctx.api, { chatId: msg.chat.id, threadId: threadIdOf(msg) }, text).catch(() => undefined);
+  if (sent) recordBotMessage(ctx.me, sent, text, `reply to /secret by ${senderOf(msg).name}`, topic);
+}
+
+/** /secret in a private chat: "/secret NAME value", or "/secret <group id> NAME value" for one of several groups. */
+async function handleSecretInPrivate(ctx: Context, args: string): Promise<void> {
+  const userId = ctx.from?.id;
+  const mine = listGroups().filter((g) => g.enabled && canManage(g, userId));
+  if (ctx.message) ctx.api.deleteMessage(ctx.message.chat.id, ctx.message.message_id).catch(() => {});
+  if (!mine.length) {
+    await ctx.reply("You are not the owner or a manager of any group I'm in, so you can't set secrets.");
+    return;
+  }
+  const [first, ...rest] = args.split(/\s+/);
+  const byId = /^-?\d+$/.test(first ?? '');
+  const chosen = byId ? mine.find((g) => String(g.chatId) === first) : mine.length === 1 ? mine[0] : undefined;
+  if (!chosen) {
+    await ctx.reply(
+      `Which group? Put its id first, e.g. /secret ${mine[0].chatId} NAME value\n\n${mine.map((g) => `• ${g.title}: ${g.chatId}`).join('\n')}`,
+    );
+    return;
+  }
+  const name = ctx.from ? [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') : 'someone';
+  const who = ctx.from?.username ? `${name} (@${ctx.from.username})` : name;
+  await ctx.reply(applySecretCommand(chosen, userId, who, (byId ? rest.join(' ') : args).trim()));
+}
+
 // ── Middleware ───────────────────────────────────────────────────────
 
 /**
@@ -1163,7 +1756,77 @@ async function greetNewMembers(ctx: Context, group: GroupState, msg: Message): P
   }
 }
 
+/**
+ * Button presses, reactions and poll votes in a group: handed to the group's hooks as events
+ * ("callback", "reaction", "poll_answer"), whose actions are then carried out. A button press
+ * that no hook answers is still acknowledged, so the button stops spinning.
+ */
+async function handleGroupEvent(ctx: Context): Promise<boolean> {
+  let chatId: number | undefined;
+  let threadId: number | undefined;
+  let event: Record<string, unknown> | undefined;
+  let callbackId: string | undefined;
+  const person = (u?: { id: number; first_name: string; last_name?: string; username?: string }) =>
+    u ? { id: u.id, name: [u.first_name, u.last_name].filter(Boolean).join(' '), username: u.username ?? null } : null;
+
+  if (ctx.callbackQuery && ctx.chat && ctx.chat.type !== 'private') {
+    const message = ctx.callbackQuery.message as Message | undefined;
+    chatId = ctx.chat.id;
+    threadId = message?.is_topic_message ? message.message_thread_id : undefined;
+    callbackId = ctx.callbackQuery.id;
+    event = {
+      event: 'callback',
+      callback_query_id: callbackId,
+      data: ctx.callbackQuery.data ?? null,
+      message_id: message?.message_id ?? null,
+      message_text: message?.text ?? message?.caption ?? null,
+      from: person(ctx.callbackQuery.from),
+      raw: ctx.callbackQuery,
+    };
+  } else if (ctx.messageReaction) {
+    const reaction = ctx.messageReaction;
+    chatId = reaction.chat.id;
+    const emoji = (list: typeof reaction.new_reaction) => list.map((r) => (r.type === 'emoji' ? r.emoji : r.type));
+    event = {
+      event: 'reaction',
+      message_id: reaction.message_id,
+      from: person(reaction.user),
+      added: emoji(reaction.new_reaction).filter((e) => !emoji(reaction.old_reaction).includes(e)),
+      removed: emoji(reaction.old_reaction).filter((e) => !emoji(reaction.new_reaction).includes(e)),
+      now: emoji(reaction.new_reaction),
+      raw: reaction,
+    };
+  } else if (ctx.pollAnswer) {
+    const poll = pollChats.get(ctx.pollAnswer.poll_id);
+    if (!poll) return true; // not one of ours, or from before a restart
+    chatId = poll.chatId;
+    event = { event: 'poll_answer', poll_id: ctx.pollAnswer.poll_id, option_ids: ctx.pollAnswer.option_ids, from: person(ctx.pollAnswer.user), raw: ctx.pollAnswer };
+  } else {
+    return false;
+  }
+
+  const group = chatId !== undefined && isGroupEnabled(chatId) ? getGroup(chatId) : undefined;
+  let answered = false;
+  if (group && sandboxEnabled() && config.SECRETARY_HOOKS && hasActiveHooks(group.chatId, event.event as HookEventType)) {
+    const topic = group.isForum ? topicNameOf(group.chatId, threadId) : undefined;
+    event.topic = topic ?? null;
+    event.local_time = localTime(new Date()).stamp;
+    try {
+      const outcomes = await runHooksForEvent(group.chatId, sandboxUidFor(group.chatId), event);
+      for (const { hook, actions } of outcomes) {
+        answered ||= actions.some((a) => a.do === 'api' && a.method === 'answerCallbackQuery');
+        await applyEventActions(ctx.api, ctx.me, group.chatId, { chatId: group.chatId, threadId }, topic, `hook ${hook.name}`, actions);
+      }
+    } catch (error) {
+      console.warn(`[Hooks] ${group.chatId}: could not run hooks on a ${String(event.event)}:`, (error as Error).message);
+    }
+  }
+  if (callbackId && !answered) await ctx.api.answerCallbackQuery(callbackId).catch(() => {});
+  return true;
+}
+
 export async function secretaryMiddleware(ctx: Context, next: NextFunction): Promise<void> {
+  if (await handleGroupEvent(ctx)) return;
   if (ctx.myChatMember) {
     await handleMembershipChange(ctx);
     return;
@@ -1178,6 +1841,11 @@ export async function secretaryMiddleware(ctx: Context, next: NextFunction): Pro
     const claim = text.match(/^\/claim(?:@\w+)?(?:\s+(\S+))?/);
     if (claim) {
       await handleClaim(ctx, claim[1] ?? '');
+      return;
+    }
+    const secret = ctx.message && secretCommandOf(ctx.message, ctx.me.username);
+    if (secret) {
+      await handleSecretInPrivate(ctx, secret.args);
       return;
     }
     if (/^\/groups(?:@\w+)?\s*$/.test(text) && isOwner(ctx.from?.id)) {
@@ -1207,9 +1875,17 @@ export async function secretaryMiddleware(ctx: Context, next: NextFunction): Pro
     migrateGroupData(chat.id, msg.migrate_to_chat_id);
     migrateGroupState(chat.id, msg.migrate_to_chat_id);
     forgetSchedules(chat.id);
+    migrateSecrets(chat.id, msg.migrate_to_chat_id);
     return;
   }
   if (msg.migrate_from_chat_id) return;
+
+  // A /secret may carry a key: it never reaches the record, the hooks or the secretary.
+  const secret = secretCommandOf(msg, ctx.me.username);
+  if (secret) {
+    await handleSecretInGroup(ctx, isGroupEnabled(chat.id) ? getGroup(chat.id) : undefined, msg, secret.args);
+    return;
+  }
 
   let recorded: Recorded = {};
   const enabledGroup = isGroupEnabled(chat.id) ? getGroup(chat.id) : undefined;

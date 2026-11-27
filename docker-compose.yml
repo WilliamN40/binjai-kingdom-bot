@@ -8,6 +8,21 @@
 #
 # They share only a unix socket (commands in, output back) and the groups'
 # record, which the sandbox can read but not change.
+#
+# Workbench backend (SANDBOX_BACKEND=workbench): instead of running commands
+# itself, the sandbox runner gives every group its own long-lived machine, a
+# gVisor container (runtime runsc) where commands run as root, can apt-get
+# install anything and may leave processes running. To switch, on the host:
+#   1. sudo deploy/workbench-firewall.sh, and install its systemd unit (see the script)
+#   2. docker compose --profile image build workbench-image
+#   3. in .env: SANDBOX_BACKEND=workbench
+#               HOST_DATA_DIR=<absolute host path of ./data>
+#               SANDBOX_DOCKER_SOCKET=/var/run/docker.sock
+#   4. docker compose up -d --build sandbox
+# With the docker socket mounted the runner is root-equivalent on the host. That
+# is acceptable because only the bot can reach the runner's socket and, in this
+# mode, the runner never runs group commands itself. In local mode the socket is
+# not mounted (/dev/null stands in for it).
 name: binjaibot
 
 services:
@@ -63,12 +78,19 @@ services:
     read_only: true
     environment:
       TZ: ${SECRETARY_TIMEZONE:-Asia/Singapore}
-      SANDBOX_QUOTA_MB: ${SANDBOX_QUOTA_MB:-1024}
+      SANDBOX_QUOTA_MB: ${SANDBOX_QUOTA_MB:-8192}
       # Optional: a GitHub token the groups' scripts may use. Everyone who can ask the
       # secretary to run commands can use it, so scope it to what they may already do.
       SANDBOX_GITHUB_TOKEN: ${SANDBOX_GITHUB_TOKEN:-}
+      # local (commands run here, one Linux user per group) or workbench (see the top).
+      SANDBOX_BACKEND: ${SANDBOX_BACKEND:-local}
+      # Workbench only: where ./data is on the host. The docker daemon resolves the
+      # workbenches' bind mounts on the host, not in this container.
+      HOST_DATA_DIR: ${HOST_DATA_DIR:-}
     volumes:
       - sandbox-socket:/run/sandbox
+      # Workbench only: the host's docker daemon, to manage the workbench containers.
+      - ${SANDBOX_DOCKER_SOCKET:-/dev/null}:/run/docker.sock
       # Each group's workspace (files the secretary creates).
       - ./data/sandbox:/work
       # The groups' record. Group folders are closed to every sandbox user except their own.
@@ -77,8 +99,10 @@ services:
       - /dev/shm:size=1m,mode=0700
       # iptables keeps its lock file here
       - /run:size=1m,mode=0755
-    # The runner starts as root only to set the firewall and to switch each command
-    # to its group's user. These capabilities are all it has; commands get none.
+    # The runner starts as root only to set the firewall, to switch each command
+    # to its group's user and to measure workspaces for the quota (DAC_READ_SEARCH:
+    # in workbench mode they hold files owned by the workbench's root). These
+    # capabilities are all it has; commands in local mode get none.
     cap_drop:
       - ALL
     cap_add:
@@ -86,13 +110,21 @@ services:
       - SETGID
       - CHOWN
       - KILL
+      - DAC_READ_SEARCH
       - NET_ADMIN
     security_opt:
       - no-new-privileges:true
-    mem_limit: 2g
-    cpus: 1.5
-    pids_limit: 256
+    mem_limit: 4g
+    cpus: 2
+    pids_limit: 1024
     logging: *logging
+
+  # Only builds the image the runner starts each group's workbench from; never run.
+  #   docker compose --profile image build workbench-image
+  workbench-image:
+    profiles: ["image"]
+    build: ./sandbox/workbench
+    image: binjaibot-workbench:latest
 
 networks:
   sandbox-net:

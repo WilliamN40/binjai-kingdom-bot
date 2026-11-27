@@ -1755,6 +1755,41 @@
             <h3>Intelligent Routing</h3>
             <p>Talk naturally — Claude automatically uses the right tools for Reddit, Medium, YouTube, and project management without explicit commands.</p>
           </div>
+          <div class="feature-card" data-category="session">
+            <div class="feature-icon">📒</div>
+            <h3>Group Secretary</h3>
+            <p>Records every topic of a group and answers questions about it, with reminders, recurring tasks, hooks that react to messages, and a daily digest.</p>
+          </div>
+          <div class="feature-card" data-category="core">
+            <div class="feature-icon">🎛️</div>
+            <h3>Configure From the Chat</h3>
+            <p>The owner or a manager just asks: send every answer to one topic, set house rules like "answer in English", switch model or effort. No redeploy.</p>
+          </div>
+          <div class="feature-card" data-category="core">
+            <div class="feature-icon">🖥️</div>
+            <h3>Its Own Machine</h3>
+            <p>Each group gets an isolated gVisor Linux machine where the secretary is root: apt install anything, keep services running, browse with headless Chromium.</p>
+          </div>
+          <div class="feature-card" data-category="core">
+            <div class="feature-icon">🔌</div>
+            <h3>MCP and Keys From Chat</h3>
+            <p>Add MCP servers by asking, and hand over API keys with /secret (deleted from the chat at once, never recorded). New tools without touching code.</p>
+          </div>
+          <div class="feature-card" data-category="media">
+            <div class="feature-icon">📲</div>
+            <h3>Every Telegram Feature</h3>
+            <p>Calls any Bot API method in its group: polls, quizzes, buttons, dice, stickers, albums, reactions, edits, topics, and moderation for the owner or managers. Button presses, reactions and votes can trigger hooks.</p>
+          </div>
+          <div class="feature-card" data-category="media">
+            <div class="feature-icon">🖼️</div>
+            <h3>Sees Earlier Photos</h3>
+            <p>Looks at screenshots and photos posted earlier in the group, opens any earlier file (PDF, spreadsheet, voice note) by message number, and posts images as real photos.</p>
+          </div>
+          <div class="feature-card" data-category="session">
+            <div class="feature-icon">🚀</div>
+            <h3>Deploy From Chat</h3>
+            <p>The secretary can open pull requests on its own code; the owner reviews the commit list with /deploy and confirms, and the server rebuilds with automatic rollback.</p>
+          </div>
         </div>
       </div>
     </section>
@@ -1933,6 +1968,79 @@
             <div class="command-row">
               <code class="command-code">/transcribe</code>
               <span class="command-desc">Transcribe audio without sending to agent</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="command-category">
+          <h3 class="command-category-title">
+            <span class="command-category-icon">📒</span>
+            Group Secretary
+          </h3>
+          <div class="commands-grid">
+            <div class="command-row">
+              <code class="command-code">/ask &lt;question&gt;</code>
+              <span class="command-desc">Ask about anything said in the group, or anything else</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/summary [period]</code>
+              <span class="command-desc">Recap the discussion, e.g. /summary this week</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/catchup</code>
+              <span class="command-desc">What happened since you last wrote</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/reminders</code>
+              <span class="command-desc">Reminders, recurring tasks and scheduled scripts</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/hooks [on|off &lt;name&gt;]</code>
+              <span class="command-desc">Scripts that react to messages (maker, admins, owner or managers switch them)</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/settings</code>
+              <span class="command-desc">Where answers go, model, house rules, managers, secrets and MCP servers</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/answerhere [off]</code>
+              <span class="command-desc">Post every answer in this topic (owner or manager)</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/model &lt;name&gt;</code>
+              <span class="command-desc">Show or set the Claude model for this group (owner or manager)</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/effort &lt;level&gt;</code>
+              <span class="command-desc">Show or set how hard the secretary thinks (owner or manager)</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/manager add|remove @user</code>
+              <span class="command-desc">Owner: let someone change the group's settings</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/secret NAME value</code>
+              <span class="command-desc">Hand over an API key (best in DM); the message is deleted and never recorded</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/machine [reset]</code>
+              <span class="command-desc">Status of the group's own machine, or rebuild it from a clean image</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/deploy [branch]</code>
+              <span class="command-desc">Owner: review and confirm a new version of the bot</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/version</code>
+              <span class="command-desc">Which commit is running</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/usage [days]</code>
+              <span class="command-desc">Who used how much Claude</span>
+            </div>
+            <div class="command-row">
+              <code class="command-code">/stop</code>
+              <span class="command-desc">Stop the answer in progress</span>
             </div>
           </div>
         </div>

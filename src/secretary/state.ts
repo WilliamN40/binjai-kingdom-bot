@@ -24,10 +24,33 @@ export interface GroupState {
   welcome?: string;
   /** Reasoning effort for this group's answers; unset means the configured default. */
   effort?: EffortLevel;
+  /** Claude model id for this group's answers; unset means the configured default. */
+  model?: string;
+  /** Forum topic (thread id) that receives every answer, wherever the question was asked. 0 is General. */
+  answerTopic?: number;
+  /** Rules for every answer in this group, set from the chat by the owner or a manager. */
+  houseRules?: string;
+  /** Telegram user ids who may change this group's settings, besides the bot's owners. */
+  managers?: number[];
 }
 
 export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+/** Short names for models; any other "claude-..." model id is accepted as well. */
+export const MODEL_CHOICES: Record<string, string> = {
+  fable: 'claude-fable-5-2',
+  opus: 'claude-opus-5-5',
+  sonnet: 'claude-sonnet-5-5',
+  haiku: 'claude-haiku-5-5',
+};
+
+/** A short name or a full model id, as a model id; undefined if it is neither. */
+export function resolveModel(value: string): string | undefined {
+  const wanted = value.trim().toLowerCase();
+  if (Object.hasOwn(MODEL_CHOICES, wanted)) return MODEL_CHOICES[wanted];
+  return /^claude-[a-z0-9][a-z0-9.-]{2,60}$/.test(wanted) ? wanted : undefined;
+}
 
 const SANDBOX_UID_BASE = 20000;
 
@@ -184,6 +207,10 @@ export function enableGroup(
     sandboxUid: existing?.sandboxUid,
     welcome: existing?.welcome,
     effort: existing?.effort,
+    model: existing?.model,
+    answerTopic: existing?.answerTopic,
+    houseRules: existing?.houseRules,
+    managers: existing?.managers,
   };
   s.groups[String(chatId)] = group;
   save();
@@ -234,6 +261,55 @@ export function setGroupEffort(chatId: number, effort: EffortLevel | undefined):
   if (effort) group.effort = effort;
   else delete group.effort;
   save();
+}
+
+/**
+ * May this person change the group's settings (from a command or by asking the secretary)?
+ * Always decided from a Telegram user id, never from a name or from anything in the prompt.
+ */
+export function canManage(group: GroupState, userId: number | undefined): boolean {
+  if (userId === undefined) return false;
+  return isOwner(userId) || (group.managers ?? []).includes(userId);
+}
+
+/** The settings anyone in the group may change by asking, and those that only change through here. */
+export interface GroupSettingsChange {
+  model?: string | null;
+  effort?: EffortLevel | null;
+  answerTopic?: number | null;
+  houseRules?: string | null;
+  managers?: number[];
+}
+
+/** Apply a change to the group's settings; null clears a setting back to its default. */
+export function updateGroupSettings(chatId: number, change: GroupSettingsChange): GroupState | undefined {
+  const s = load();
+  const group = s.groups[String(chatId)];
+  if (!group) return undefined;
+  const set = <K extends keyof GroupSettingsChange & keyof GroupState>(key: K) => {
+    const value = change[key];
+    if (value === undefined) return;
+    if (value === null) delete group[key];
+    else (group as unknown as Record<string, unknown>)[key] = value;
+  };
+  set('model');
+  set('effort');
+  set('answerTopic');
+  set('houseRules');
+  if (change.managers) {
+    if (change.managers.length) group.managers = [...new Set(change.managers)];
+    else delete group.managers;
+  }
+  save();
+  return group;
+}
+
+export function setGroupModel(chatId: number, model: string | undefined): void {
+  updateGroupSettings(chatId, { model: model ?? null });
+}
+
+export function setAnswerTopic(chatId: number, threadId: number | undefined): void {
+  updateGroupSettings(chatId, { answerTopic: threadId ?? null });
 }
 
 /** Keep the stored title / username / forum flag in sync with what Telegram reports. */

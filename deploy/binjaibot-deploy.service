@@ -1,0 +1,11 @@
+[Unit]
+Description=Deploy the commit binjaibot asked for
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Environment=APP_DIR=__APP_DIR__
+Environment=APP_USER=__APP_USER__
+ExecStart=/bin/bash __APP_DIR__/deploy/deploy.sh
+TimeoutStartSec=30min

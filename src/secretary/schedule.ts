@@ -37,6 +37,8 @@ export interface Schedule {
   threadId?: number;
   topic?: string;
   createdBy: string;
+  /** Telegram user id of the creator: a task runs with that person's rights. */
+  createdById?: number;
   createdAt: string;
   lastRun?: string;
 }
@@ -50,6 +52,7 @@ export interface ScheduleInput {
   threadId?: number;
   topic?: string;
   createdBy: string;
+  createdById?: number;
 }
 
 const TICK_MS = 20_000;
@@ -155,6 +158,7 @@ export function createSchedule(chatId: number, input: ScheduleInput): Schedule {
     threadId: input.threadId,
     topic: input.topic,
     createdBy: input.createdBy,
+    ...(input.createdById !== undefined ? { createdById: input.createdById } : {}),
     createdAt: now.toISOString(),
   };
   schedules.push(schedule);

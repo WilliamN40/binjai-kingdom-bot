@@ -460,3 +460,202 @@ test('the system prompt names the group and explains forum topics only for forum
   assert.doesNotMatch(plain, /forum split into topics/);
   assert.match(forum, /forum split into topics/);
 });
+
+// ── Capabilities added after the first week in a real group ──────────
+
+test('hooks can post a photo from https or the workspace, and delete an earlier message by id', () => {
+  assert.deepEqual(hooks.parseActions('{"do":"photo","url":"https://example.com/a.jpg","caption":"hi"}'), [
+    { do: 'photo', url: 'https://example.com/a.jpg', caption: 'hi', reply: true },
+  ]);
+  assert.deepEqual(hooks.parseActions('{"do":"photo","file":"./pics/a.png","reply":false}'), [
+    { do: 'photo', file: 'pics/a.png', reply: false },
+  ]);
+  // Plain http, absolute paths, ".." and hidden folders are refused.
+  for (const bad of ['{"url":"http://169.254.169.254/x"}', '{"file":"/etc/passwd"}', '{"file":"../x.jpg"}', '{"file":".ssh/id"}', '{"file":"a/.git/x"}']) {
+    assert.deepEqual(hooks.parseActions(`{"do":"photo",${bad.slice(1)}`), [], bad);
+  }
+  assert.deepEqual(hooks.parseActions('[{"do":"delete"},{"do":"delete","message_id":29508},{"do":"delete","message_id":"x"}]'), [
+    { do: 'delete' },
+    { do: 'delete', message_id: 29508 },
+    { do: 'delete' },
+  ]);
+});
+
+test('pictures are indexed by message number so the secretary can look at them later', () => {
+  const chatId = -1009990040;
+  assert.equal(transcript.findMedia(chatId, 5), undefined);
+  transcript.recordMedia(chatId, { msg: 5, fileId: 'old', mediaType: 'image/jpeg' });
+  transcript.recordMedia(chatId, { msg: 51, fileId: 'other', mediaType: 'image/png' });
+  transcript.recordMedia(chatId, { msg: 5, fileId: 'edited', mediaType: 'image/jpeg' });
+  assert.equal(transcript.findMedia(chatId, 5)?.fileId, 'edited', 'the latest version wins');
+  assert.equal(transcript.findMedia(chatId, 51)?.mediaType, 'image/png');
+  assert.equal(transcript.findMedia(chatId, 6), undefined);
+});
+
+test('group settings change from the chat, survive re-enabling, and only owners or managers may change them', () => {
+  const chatId = -1007770010;
+  state.enableGroup(chatId, { title: 'Settings', enabledBy: 111, isForum: true });
+  const group = () => state.getGroup(chatId)!;
+
+  assert.equal(state.resolveModel('Sonnet'), 'claude-sonnet-5-5');
+  assert.equal(state.resolveModel('claude-opus-5-5'), 'claude-opus-5-5');
+  assert.equal(state.resolveModel('kimi'), undefined);
+  assert.equal(state.resolveModel('toString'), undefined);
+
+  state.updateGroupSettings(chatId, { model: 'claude-sonnet-5-5', answerTopic: 4242, houseRules: 'Answer in English.', managers: [222, 222] });
+  state.enableGroup(chatId, { title: 'Settings renamed', enabledBy: 111, isForum: true });
+  assert.equal(group().model, 'claude-sonnet-5-5');
+  assert.equal(group().answerTopic, 4242);
+  assert.equal(group().houseRules, 'Answer in English.');
+  assert.deepEqual(group().managers, [222]);
+
+  // Rights come from user ids only: the owner (claimed below) and listed managers.
+  assert.equal(state.canManage(group(), 222), true);
+  assert.equal(state.canManage(group(), 333), false);
+  assert.equal(state.canManage(group(), undefined), false, 'a hook-originated run has no rights');
+
+  state.updateGroupSettings(chatId, { model: null, answerTopic: null, houseRules: null, managers: [] });
+  assert.equal(group().model, undefined);
+  assert.equal(group().answerTopic, undefined);
+  assert.equal(group().houseRules, undefined);
+  assert.equal(group().managers, undefined);
+});
+
+test('topics and members are found by name for settings changes', () => {
+  const chatId = -1009990050;
+  transcript.setTopicName(chatId, 4242, 'Off topic');
+  assert.equal(transcript.findTopicId(chatId, '#off TOPIC'), 4242);
+  assert.equal(transcript.findTopicId(chatId, 'General'), 0);
+  assert.equal(transcript.findTopicId(chatId, 'nope'), undefined);
+  transcript.noteMember(chatId, { id: 555000111, name: 'Dana', username: 'dana_k' }, new Date());
+  assert.equal(transcript.findMember(chatId, '@Dana_K')?.id, 555000111);
+  assert.equal(transcript.findMember(chatId, 'dana')?.id, 555000111);
+  assert.equal(transcript.findMember(chatId, 'someone'), undefined);
+  assert.equal(transcript.memberName(chatId, 555000111), 'Dana (@dana_k)');
+});
+
+test('the system prompt tells the secretary to try its tools before saying it cannot, and who decides', () => {
+  const group = { chatId: -1001234567890, title: 'Binjai Kingdom', enabled: true, enabledAt: '2026-11-26T00:00:00Z', enabledBy: 1 };
+  const prompt = buildSystemPrompt(group, 'Sekre');
+  assert.match(prompt, /Before saying you can't do something/);
+  assert.match(prompt, /say plainly that you won't and why/);
+  assert.match(prompt, /## Who decides/);
+  assert.match(prompt, /group_settings tool changes on the spot/);
+  assert.doesNotMatch(prompt, /## House rules for this group/);
+  assert.match(buildSystemPrompt({ ...group, houseRules: 'Answer in English.' }, 'Sekre'), /## House rules for this group[\s\S]*Answer in English\./);
+  assert.match(prompt, /view_image/);
+  assert.doesNotMatch(prompt, /moderate the group/, 'hooks can delete and pin, so it is not told it cannot moderate');
+});
+
+test('secrets are kept per group, never listed with their values, and become sandbox variables', async () => {
+  const secrets = await import('../src/secretary/secrets.js');
+  const chatId = -1009990060;
+  secrets.setSecret(chatId, 'AGENTMAIL_API_KEY', 'am_us_123', 'Alice (@alice)');
+  secrets.setSecret(chatId, 'GH_TOKEN', 'github_pat_x', 'Alice (@alice)');
+  assert.deepEqual(secrets.listSecrets(chatId).map((s) => s.name), ['AGENTMAIL_API_KEY', 'GH_TOKEN']);
+  assert.doesNotMatch(JSON.stringify(secrets.listSecrets(chatId)), /am_us_123/);
+  assert.deepEqual(secrets.secretEnv(chatId), { AGENTMAIL_API_KEY: 'am_us_123', GH_TOKEN: 'github_pat_x' });
+  assert.deepEqual(secrets.secretEnv(-1), {}, 'other groups see nothing');
+
+  assert.throws(() => secrets.setSecret(chatId, 'lowercase', 'v', 'A'), /secret name/);
+  assert.throws(() => secrets.setSecret(chatId, 'PATH', 'v', 'A'), /set by the workspace/);
+  assert.throws(() => secrets.setSecret(chatId, 'EMPTY', '', 'A'), /value/);
+
+  const stat = fs.statSync(path.join(dataDir, 'secrets.json'));
+  if (process.platform !== 'win32') assert.equal(stat.mode & 0o077, 0, 'readable by the bot only');
+  assert.ok(!fs.existsSync(path.join(transcript.groupDir(chatId), 'secrets.json')), 'not inside the folder the sandbox can read');
+
+  secrets.resetSecretsCache(); // as after a restart
+  assert.equal(secrets.removeSecret(chatId, 'GH_TOKEN'), true);
+  assert.equal(secrets.removeSecret(chatId, 'GH_TOKEN'), false);
+  secrets.forgetSecrets(chatId);
+  assert.deepEqual(secrets.listSecrets(chatId), []);
+});
+
+test('MCP servers are registered per group, validated, and their tools pass the guard', async () => {
+  const mcp = await import('../src/secretary/mcp.js');
+  const chatId = -1009990070;
+  assert.match(mcp.mcpNameProblem('secretary') ?? '', /taken/);
+  assert.match(mcp.mcpNameProblem('Bad Name') ?? '', /lowercase/);
+  const server = mcp.saveMcpServer(chatId, { name: 'agentmail', command: 'npx -y agentmail-mcp', description: 'Email inbox', tools: ['send_message', 'list_threads'], createdBy: 'William' });
+  assert.equal(server.enabled, true);
+  assert.match(mcp.describeMcpServer(server), /send_message, list_threads/);
+  mcp.setMcpEnabled(chatId, 'agentmail', false);
+  mcp.forgetMcpServers(chatId); // as after a restart
+  assert.equal(mcp.listMcpServers(chatId)[0].enabled, false);
+  assert.deepEqual(Object.keys(mcp.sdkMcpServers(chatId, 20001)), [], 'switched-off servers are not started');
+  mcp.setMcpEnabled(chatId, 'agentmail', true);
+  const config = mcp.sdkMcpServers(chatId, 20001).agentmail;
+  assert.equal(config.env.MCP_BRIDGE_GROUP, 'group_1009990070');
+  assert.match(config.env.MCP_BRIDGE_COMMAND, /npx -y agentmail-mcp.*mcp-agentmail\.log/);
+
+  const root = path.join(dataDir, 'groups', 'group_1009990070');
+  const options = { webSearch: true, ownTools: [], mcpServers: ['agentmail'] };
+  assert.equal(checkToolUse('mcp__agentmail__send_message', {}, root, options).allowed, true);
+  assert.equal(checkToolUse('mcp__other__send_message', {}, root, options).allowed, false);
+  assert.equal(checkToolUse('mcp__agentmail_evil__x', {}, root, options).allowed, false);
+  assert.equal(mcp.removeMcpServer(chatId, 'agentmail')?.name, 'agentmail');
+});
+
+test('scripts and hooks can pin or delete an earlier message by id', () => {
+  assert.deepEqual(hooks.parseActions('{"actions":[{"do":"pin","message_id":42},{"do":"pin"}]}'), [{ do: 'pin', message_id: 42 }, { do: 'pin' }]);
+});
+
+test('a deploy plan lists the commits and flags changes to containers and the sandbox', async () => {
+  const { describePlan } = await import('../src/secretary/deploy.js');
+  const text = describePlan({
+    sha: 'abcdef1234567890abcdef1234567890abcdef12',
+    ref: 'main',
+    current: '1111111222222233333334444444555555566666',
+    commits: [{ sha: 'abcdef1', title: 'Add workbench', author: 'Dana' }],
+    files: ['src/secretary/group.ts', 'sandbox/runner.mjs', 'docker-compose.yml'],
+    sensitive: ['sandbox/runner.mjs', 'docker-compose.yml'],
+    behind: false,
+  });
+  assert.match(text, /abcdef1 Add workbench \(Dana\)/);
+  assert.match(text, /sandbox\/runner\.mjs, docker-compose\.yml/);
+  assert.match(text, /\/deploy confirm abcdef1/);
+  assert.match(describePlan({ sha: 'a'.repeat(40), ref: 'main', current: 'a'.repeat(40), commits: [], files: [], sensitive: [], behind: false }), /already running/);
+});
+
+test('any Bot API method can be called, always in this group, with rights by method', async () => {
+  const tg = await import('../src/secretary/telegram-api.js');
+  assert.equal(tg.methodLevel('sendPoll'), 'open');
+  assert.equal(tg.methodLevel('banChatMember'), 'managed');
+  assert.equal(tg.methodLevel('setMyCommands'), 'owner');
+  assert.equal(tg.methodLevel('someFutureMethod'), 'owner', 'unknown methods are for the owner');
+  assert.equal(tg.methodLevel('logOut'), 'forbidden');
+
+  const where = { chatId: -1001234500000, threadId: 4242 };
+  const read = async (file: string) => Buffer.from(`contents of ${file}`);
+  const poll = await tg.prepareCall('sendPoll', { chat_id: -999, question: 'Dinner?', options: [{ text: 'A' }] }, where, read);
+  assert.equal(poll.chat_id, -1001234500000, 'another chat id is overwritten');
+  assert.equal(poll.message_thread_id, 4242, 'sends go to the current topic by default');
+  const copy = await tg.prepareCall('copyMessage', { from_chat_id: -42, message_id: 5 }, where, read);
+  assert.equal(copy.from_chat_id, -1001234500000, 'nothing is copied out of another chat');
+  const album = await tg.prepareCall('sendMediaGroup', { media: [{ type: 'photo', media: 'workspace:pics/a.jpg' }] }, where, read);
+  const { InputFile } = await import('grammy');
+  assert.ok((album.media as Array<{ media: unknown }>)[0].media instanceof InputFile, 'workspace files are uploaded');
+  const me = await tg.prepareCall('getMe', {}, where, read);
+  assert.equal(me.chat_id, undefined);
+  await assert.rejects(tg.prepareCall('getUpdates', {}, where, read), /not available/);
+  await assert.rejects(tg.prepareCall('editMessageText', { inline_message_id: 'x', text: 'y' }, where, read), /Only messages in this group/);
+  await assert.rejects(tg.prepareCall('send poll', {}, where, read), /not a Telegram method/);
+
+  assert.deepEqual(hooks.parseActions('{"do":"api","method":"sendDice","params":{"emoji":"🎲"}}'), [{ do: 'api', method: 'sendDice', params: { emoji: '🎲' } }]);
+});
+
+test('hooks only get the events they ask for, and risky Telegram calls stay closed', async () => {
+  const chatId = -1009990080;
+  hooks.saveHook(chatId, { name: 'old', file: 'old.py', description: 'messages only', createdBy: 'A' });
+  assert.equal(hooks.hasActiveHooks(chatId, 'callback'), false, 'existing hooks never see button presses');
+  hooks.saveHook(chatId, { name: 'menu', file: 'menu.py', description: 'buttons', createdBy: 'A', events: ['callback'] });
+  assert.equal(hooks.hasActiveHooks(chatId, 'callback'), true);
+  assert.match(hooks.describeHook(hooks.listHooks(chatId)[1]), /on callback/);
+
+  const tg = await import('../src/secretary/telegram-api.js');
+  assert.equal(tg.methodLevel('leaveChat'), 'forbidden');
+  assert.equal(tg.methodLevel('promoteChatMember'), 'forbidden');
+  const reply = await tg.prepareCall('sendMessage', { text: 'hi', reply_parameters: { message_id: 1, chat_id: -42 } }, { chatId: -100777 }, async () => Buffer.alloc(0));
+  assert.equal((reply.reply_parameters as { chat_id: number }).chat_id, -100777);
+});

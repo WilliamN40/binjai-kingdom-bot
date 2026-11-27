@@ -47,9 +47,23 @@ This fork adds a second mode on top of the private-chat coding agent: in a Teleg
 - **Long-term memory**: a small model writes a digest of each finished day (decisions, to-dos, links, keywords), which the secretary searches before the raw transcript.
 - **Housekeeping**: `/usage [days]` shows who used how much Claude; the owners get a weekly backup of all records in their private chat (`/backup` for one now) and a message if answers start failing.
 - **A sandboxed workspace**: it can run scripts, install tools, build spreadsheets and charts, convert files, and send the result into the chat. Reply to a file (PDF, Word, Excel, video, audio) and mention it to have the file processed.
-- Looks at photos it is asked about, and can search the web.
+- Looks at photos it is asked about, and at photos posted earlier in the group (by message number); posts pictures as real photos. Can search the web and drive a headless Chromium.
 - `/welcome <text>` (admins) greets new members; `/stop` cancels an answer in progress.
-- `/effort` shows how hard it thinks per answer; the owner can change it per group with `/effort low|medium|high|xhigh|max`.
+
+**Changing it from the chat** (no code change, no redeploy)
+
+The point of this fork is that a group can reshape its secretary by talking to it:
+
+- **Settings**: the owner, or a member the owner made a manager (`/manager add @user`), just asks: "send all answers to #bot", "answer everyone in English", "use sonnet", "think harder". `/settings` shows them all; `/answerhere`, `/model` and `/effort` are shortcuts. Group-wide house rules are applied to every answer.
+- **Keys**: `/secret NAME value` (best in a private chat with the bot) stores an API key for the group. The message is deleted and never recorded; the key becomes an environment variable for the group's commands, hooks, scripts and MCP servers. Anyone who can ask the secretary to run commands can use it, so only add keys the whole group may use.
+- **New tools**: the secretary can connect MCP servers itself (any stdio server: an npm or pip package, a script, or `mcp-remote` for one on the web). They run inside the group's sandbox, never in the bot's container, and their tools are available from the next question.
+- **Its own machine** (`SANDBOX_BACKEND=workbench`): each group gets a Linux machine under gVisor where the secretary is root, can `apt-get install` anything and keep services running between questions. `/machine` shows it, `/machine reset` rebuilds it from a clean image (workspace files stay; `~/.setup.sh` re-runs).
+- **Its own code**: with a GitHub token (`/secret GH_TOKEN …`) it opens pull requests on `BOT_REPO_URL`. With the host deployer installed (`deploy/install-deployer.sh`, `DEPLOY_FROM_CHAT=true`), the owner sends `/deploy [branch]`, reads the commit and file list (changes to containers, the sandbox or the deploy setup are flagged), and confirms with `/deploy confirm <sha>`. The server checks out exactly that commit, rebuilds, rolls back if the bot does not come up, and the result is posted back in the chat. `/version` shows what is running.
+- **Every Telegram feature**: the secretary can call any Bot API method in its group (polls, quizzes, inline buttons, dice, stickers, albums, reactions, editing its messages, pins, topics; moderation and group settings for the owner or managers; bot-wide methods for the owner). `chat_id` is always forced to the group, and `"workspace:<path>"` uploads a file from the workspace. Button presses, reactions and poll votes reach the hooks as events.
+- **Files from the record**: it can look at earlier photos and pull any earlier file (PDF, spreadsheet, voice note, video) into its workspace by message number (up to Telegram's 20 MB bot limit).
+- **Automation**: hooks can reply, react, pin, delete (also an earlier message by id), post photos, save notes, call everyday Bot API methods (`{"do":"api",...}`) or hand a message to the secretary; scheduled scripts can print the same actions instead of text.
+
+Rights are checked by Telegram user id in the code, never from what a message claims: settings, secrets, MCP servers and deploys need the owner (or a manager, except managers and deploys). Hooks and scheduled tasks never carry anyone's rights.
 
 **Setting it up**
 
@@ -62,9 +76,10 @@ This fork adds a second mode on top of the private-chat coding agent: in a Teleg
 Anyone in the group can talk to the secretary, so it is built to be safe to expose:
 
 - The Claude process answering a group gets read-only access to **that group's record folder only**, checked on every tool call. It has no shell and no file-writing tools of its own, and it is not given the Telegram token.
-- Commands and file writes happen in a **separate sandbox container**: no secrets in it, read-only system files, capped CPU, memory, process count and disk (1 GB per group by default), and **one Linux user per group** so groups cannot see each other's files.
+- Commands and file writes happen in a **separate sandbox container**: no secrets in it (only the group's own `/secret` keys), read-only system files, capped CPU, memory, process count and disk (8 GB per group by default, `SANDBOX_QUOTA_MB`), and **one Linux user per group** so groups cannot see each other's files.
+- With `SANDBOX_BACKEND=workbench` each group instead gets its own container under **gVisor** (a user-space kernel between the machine and the host), so being root inside it does not reach the server. The runner then manages these containers through the Docker socket, which makes the runner itself root-equivalent: only the bot can reach it, and it never runs group commands itself. The host firewall for the machines' network is `deploy/workbench-firewall.sh`.
 - The sandbox can reach the public internet, but a firewall inside it rejects every private address, so it cannot reach the host, other containers, the local network or the cloud metadata service. Outbound mail ports are blocked. Every command it runs is written to the bot's log.
-- Reminders are delivered by the bot itself; nothing in the sandbox keeps running between commands.
+- Reminders are delivered by the bot itself. In the shared sandbox nothing keeps running between commands; on a workbench machine background services may.
 
 What that leaves: a script in the sandbox can send a group's **own** record and files out to the internet, and what it does online comes from your server's address. For a sandbox with no network at all, see the comment in `docker-compose.yml`.
 
@@ -72,13 +87,17 @@ What that leaves: a script in the sandbox can send a group's **own** record and 
 
 ```
 data/
-├── state.json                     owners and enabled groups
+├── state.json                     owners, enabled groups and their settings
+├── secrets.json                   /secret keys per group (0600, not visible to the sandbox)
+├── deploy/                        /deploy requests and results, current.json
 ├── groups/group_<id>/
 │   ├── transcript/2026-11-26.txt  [2026-11-26 21:33] [#Topic] Alice (@alice) [msg 4521]: …
 │   ├── notes.md                   things it was asked to remember
 │   ├── digests/2026-11-26.md      one short summary per finished day
 │   ├── schedules.json             reminders, recurring tasks, scheduled scripts
 │   ├── hooks.json                 which hook scripts are registered and on
+│   ├── mcp.json                   the group's MCP servers
+│   ├── media.jsonl                file ids of pictures, by message number
 │   ├── usage.jsonl                one line per Claude run
 │   ├── members.json               who has spoken, message counts
 │   └── topics.json                forum topic names
@@ -105,6 +124,8 @@ sudo docker compose logs -f bot                        # shows the /claim code o
 ```
 
 Past history: export the chat from Telegram Desktop as JSON, copy `result.json` into `data/`, and run `sudo docker exec binjaibot node dist/import-cli.js /data/result.json --chat-id <id>` (add `--dry-run` first to see what it would do).
+
+Deploy from the chat (once, on the host): `sudo bash deploy/install-deployer.sh`, then `docker compose up -d --build`. Own machines per group: install gVisor (`runsc`) and register it in `/etc/docker/daemon.json` (`systemctl reload docker` is enough), run `sudo bash deploy/workbench-firewall.sh` (and enable `deploy/binjaibot-workbench-firewall.service`), set `SANDBOX_BACKEND=workbench`, `HOST_DATA_DIR=<absolute path of ./data>` and `SANDBOX_DOCKER_SOCKET=/var/run/docker.sock` in `.env`, then `docker compose --profile image build workbench-image && docker compose up -d --build`.
 
 Tests: `npm test` (unit), `npx tsx scripts/smoke-secretary.ts` (live, asks Claude real questions against a throwaway group). Inside the running container: `scripts/sandbox-check.mjs`, `scripts/e2e-check.mjs`, `scripts/resume-check.mjs` and `scripts/hooks-check.mjs` (usage in each file's header).
 

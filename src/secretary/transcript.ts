@@ -6,6 +6,7 @@
  *     topics.json                 forum topic id -> name
  *     members.json                everyone seen speaking
  *     notes.md                    things the group asked the secretary to remember
+ *     media.jsonl                 Telegram file ids of pictures, by message number
  *
  * Everything for a group lives in a single folder on purpose: a question asked
  * in one topic can be answered from what was said in any other topic.
@@ -91,6 +92,51 @@ export function appendTranscript(chatId: number, date: Date, body: string, topic
   const topicTag = topic ? ` [#${topic}]` : '';
   const line = `[${stamp}]${topicTag} ${flatten(body)}\n`;
   fs.appendFileSync(path.join(transcriptDir(chatId), `${day}.txt`), line, 'utf8');
+}
+
+// ── Media index ──────────────────────────────────────────────────────
+
+/**
+ * Telegram file ids of the pictures and files posted in the group, so the
+ * secretary can look at or open one later by its message number. The transcript
+ * itself only says "[photo]" or "[file: x]". Kept in media.jsonl, one JSON object per line.
+ */
+export interface MediaEntry {
+  msg: number;
+  fileId: string;
+  mediaType: string;
+  /** For files other than pictures: the name to save it under, and its size in bytes. */
+  fileName?: string;
+  size?: number;
+}
+
+function mediaPath(chatId: number): string {
+  return path.join(groupDir(chatId), 'media.jsonl');
+}
+
+export function recordMedia(chatId: number, entry: MediaEntry): void {
+  ensureGroupDir(chatId);
+  fs.appendFileSync(mediaPath(chatId), `${JSON.stringify(entry)}\n`, 'utf8');
+}
+
+/** The picture posted as this message, if one was recorded (the latest wins after an edit). */
+export function findMedia(chatId: number, messageId: number): MediaEntry | undefined {
+  let lines: string[];
+  try {
+    lines = fs.readFileSync(mediaPath(chatId), 'utf8').split('\n');
+  } catch {
+    return undefined;
+  }
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].includes(`"msg":${messageId},`)) continue;
+    try {
+      const entry = JSON.parse(lines[i]) as MediaEntry;
+      if (entry.msg === messageId) return entry;
+    } catch {
+      // a torn line from a crash; keep looking
+    }
+  }
+  return undefined;
 }
 
 function listTranscriptFiles(chatId: number): string[] {
@@ -223,6 +269,17 @@ export function setTopicName(chatId: number, threadId: number, rawName: string):
   atomicWriteFileSync(topicsPath(chatId), JSON.stringify(topics, null, 2));
 }
 
+/** Thread id of a topic by its name ("#Off topic", "off topic"); 0 for General. */
+export function findTopicId(chatId: number, name: string): number | undefined {
+  const wanted = name.replace(/^#/, '').trim().toLowerCase();
+  if (!wanted) return undefined;
+  if (wanted === GENERAL_TOPIC.toLowerCase()) return 0;
+  for (const [id, topic] of Object.entries(loadTopics(chatId))) {
+    if (topic.name.toLowerCase() === wanted) return Number(id);
+  }
+  return undefined;
+}
+
 export function listTopicNames(chatId: number): string[] {
   return Object.values(loadTopics(chatId)).map((t) => t.name);
 }
@@ -243,6 +300,22 @@ type MemberMap = Record<string, Member>;
 const memberCache = new Map<number, MemberMap>();
 const dirtyMembers = new Set<number>();
 let memberFlushTimer: ReturnType<typeof setInterval> | null = null;
+
+/** A member who has spoken in the group, by @username or display name. */
+export function findMember(chatId: number, query: string): { id: number; name: string; username?: string } | undefined {
+  const wanted = query.replace(/^@/, '').trim().toLowerCase();
+  if (!wanted) return undefined;
+  const members = Object.entries(loadMembers(chatId));
+  const hit =
+    members.find(([, m]) => m.username?.toLowerCase() === wanted) ?? members.find(([, m]) => m.name.toLowerCase() === wanted);
+  return hit ? { id: Number(hit[0]), name: hit[1].name, username: hit[1].username } : undefined;
+}
+
+export function memberName(chatId: number, userId: number): string {
+  const member = loadMembers(chatId)[String(userId)];
+  if (!member) return `user ${userId}`;
+  return member.username ? `${member.name} (@${member.username})` : member.name;
+}
 
 function membersPath(chatId: number): string {
   return path.join(groupDir(chatId), 'members.json');
