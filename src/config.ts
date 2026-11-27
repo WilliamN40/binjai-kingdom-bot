@@ -75,6 +75,11 @@ const envSchema = z.object({
   SECRETARY_BACKUPS: z.string().default('true').transform(toBool),
   // The bot's own repository, so the secretary can propose changes to itself as pull requests
   BOT_REPO_URL: z.string().default(''),
+  // Let the owner deploy a commit from the chat with /deploy (needs deploy/install-deployer.sh on the host)
+  DEPLOY_FROM_CHAT: z.string().default('false').transform(toBool),
+  // How the sandbox runs group commands: "local" (shared container, unprivileged users) or
+  // "workbench" (each group gets its own gVisor machine with root). Set on both containers.
+  SANDBOX_BACKEND: z.enum(['local', 'workbench']).default('local'),
   // GitHub token made available inside the sandbox (also set on the sandbox container)
   SANDBOX_GITHUB_TOKEN: z.string().optional(),
   WORKSPACE_DIR: z.string().default(process.env.HOME || '.'),

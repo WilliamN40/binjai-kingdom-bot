@@ -9,6 +9,7 @@
 import * as net from 'net';
 import * as path from 'path';
 import { config } from '../config.js';
+import { secretEnv } from './secrets.js';
 import { groupDir } from './transcript.js';
 
 export interface SandboxResult {
@@ -35,6 +36,8 @@ interface SandboxRequest {
   binary?: boolean;
   /** "hook" requests run beside the secretary's own commands instead of queueing behind them. */
   lane?: 'main' | 'hook';
+  /** Machine management instead of a command (workbench backend). */
+  action?: 'status' | 'reset';
 }
 
 export const MAX_SEND_FILE_BYTES = 45_000_000;
@@ -54,7 +57,9 @@ function request(chatId: number, uid: number, body: SandboxRequest): Promise<San
     );
 
     socket.on('connect', () => {
-      socket.write(JSON.stringify({ group: path.basename(groupDir(chatId)), uid, ...body }) + '\n');
+      // The group's secrets ride along as environment variables; the request's own variables win.
+      const env = { ...secretEnv(chatId), ...(body.env ?? {}) };
+      socket.write(JSON.stringify({ group: path.basename(groupDir(chatId)), uid, ...body, env }) + '\n');
     });
     socket.on('data', (chunk) => chunks.push(chunk));
     socket.on('error', (error) => {
@@ -73,6 +78,13 @@ function request(chatId: number, uid: number, body: SandboxRequest): Promise<San
       }
     });
   });
+}
+
+/** Ask the runner about the group's own machine (workbench backend): "status", or "reset" to rebuild it fresh. */
+export async function sandboxMachineAction(chatId: number, uid: number, action: 'status' | 'reset'): Promise<Record<string, unknown>> {
+  const reply = (await request(chatId, uid, { action, command: '' })) as unknown as Record<string, unknown>;
+  const { ok: _ok, ...rest } = reply;
+  return rest;
 }
 
 /** Run a shell command in the group's workspace. */

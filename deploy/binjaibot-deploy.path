@@ -1,0 +1,8 @@
+[Unit]
+Description=Deploy binjaibot when the bot asks for it (owner-confirmed /deploy)
+
+[Path]
+PathExists=__APP_DIR__/data/deploy/request.json
+
+[Install]
+WantedBy=multi-user.target

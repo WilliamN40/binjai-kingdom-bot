@@ -29,6 +29,8 @@ export interface Hook {
   enabled: boolean;
   createdBy: string;
   createdAt: string;
+  /** Which events it runs on; unset means new and edited messages only. */
+  events?: HookEventType[];
   lastError?: string;
   lastErrorAt?: string;
 }
@@ -37,15 +39,24 @@ export type HookAction =
   | { do: 'reply'; text: string }
   | { do: 'send'; text: string }
   | { do: 'react'; emoji: string }
-  | { do: 'delete' }
-  | { do: 'pin' }
+  /** A picture posted as a real photo: from an https URL (Telegram fetches it) or a file in the workspace. */
+  | { do: 'photo'; url?: string; file?: string; caption?: string; reply: boolean }
+  /** Without message_id: the message the hook is running on. With it: an earlier message in the group. */
+  | { do: 'delete'; message_id?: number }
+  | { do: 'pin'; message_id?: number }
   | { do: 'note'; text: string }
-  | { do: 'ask'; prompt: string };
+  | { do: 'ask'; prompt: string }
+  /** Any Telegram Bot API method that anyone may use (see telegram-api.ts), pointed at this group. */
+  | { do: 'api'; method: string; params: Record<string, unknown> };
 
 export interface HookOutcome {
   hook: Hook;
   actions: HookAction[];
 }
+
+export const HOOK_EVENTS = ['message', 'edit', 'callback', 'reaction', 'poll_answer'] as const;
+export type HookEventType = (typeof HOOK_EVENTS)[number];
+const DEFAULT_EVENTS: HookEventType[] = ['message', 'edit'];
 
 const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 const FILE_PATTERN = /^[A-Za-z0-9][\w.-]{0,79}\.(py|js|mjs|sh)$/;
@@ -81,15 +92,17 @@ export function listHooks(chatId: number): Hook[] {
   return [...load(chatId)];
 }
 
-export function hasActiveHooks(chatId: number): boolean {
-  return load(chatId).some((hook) => hook.enabled);
+export function hasActiveHooks(chatId: number, type?: HookEventType): boolean {
+  return load(chatId).some((hook) => hook.enabled && (!type || (hook.events ?? DEFAULT_EVENTS).includes(type)));
 }
 
 /** Register a hook, or update the one with the same name. It starts enabled. */
 export function saveHook(
   chatId: number,
-  input: { name: string; file: string; description: string; createdBy: string },
+  input: { name: string; file: string; description: string; createdBy: string; events?: HookEventType[] },
 ): Hook {
+  const events = input.events?.length ? [...new Set(input.events)].filter((e) => HOOK_EVENTS.includes(e)) : undefined;
+  const sameAsDefault = !events || (events.length === 2 && events.includes('message') && events.includes('edit'));
   const name = input.name.trim().toLowerCase();
   const file = input.file.trim().replace(/^hooks\//, '');
   if (!NAME_PATTERN.test(name)) {
@@ -105,6 +118,8 @@ export function saveHook(
     existing.file = file;
     existing.description = input.description.trim().slice(0, 300);
     existing.enabled = true;
+    if (sameAsDefault) delete existing.events;
+    else existing.events = events;
     delete existing.lastError;
     delete existing.lastErrorAt;
     save(chatId);
@@ -119,6 +134,7 @@ export function saveHook(
     enabled: true,
     createdBy: input.createdBy,
     createdAt: new Date().toISOString(),
+    ...(sameAsDefault ? {} : { events }),
   };
   hooks.push(hook);
   save(chatId);
@@ -145,7 +161,8 @@ export function removeHook(chatId: number, name: string): Hook | undefined {
 export function describeHook(hook: Hook): string {
   const state = hook.enabled ? 'on' : 'off';
   const error = hook.lastError ? ` (last error ${hook.lastErrorAt}: ${hook.lastError})` : '';
-  return `[${hook.name}] ${state}, hooks/${hook.file}, by ${hook.createdBy}: ${hook.description}${error}`;
+  const events = hook.events ? `, on ${hook.events.join('/')}` : '';
+  return `[${hook.name}] ${state}${events}, hooks/${hook.file}, by ${hook.createdBy}: ${hook.description}${error}`;
 }
 
 export function forgetHooks(chatId: number): void {
@@ -202,7 +219,10 @@ export function buildHookEvent(msg: Message, topic: string | undefined, edited: 
   };
 }
 
-function parseActions(stdout: string): HookAction[] {
+/** A workspace path a hook may post: relative, no "..", no hidden folders. */
+const WORKSPACE_FILE = /^(?!\/)(?!.*(?:^|\/)\.)[\w./-]{1,300}$/;
+
+export function parseActions(stdout: string): HookAction[] {
   const text = stdout.trim();
   if (!text) return [];
   const parsed = JSON.parse(text) as unknown;
@@ -228,13 +248,28 @@ function parseActions(stdout: string): HookAction[] {
       case 'react':
         if (str('emoji', 16)) actions.push({ do: 'react', emoji: str('emoji', 16) });
         break;
-      case 'delete':
-      case 'pin':
-        actions.push({ do: action.do });
+      case 'photo': {
+        const url = str('url', 2000).trim();
+        const file = str('file', 300).trim().replace(/^\.\//, '');
+        const caption = str('caption', 1024);
+        const source = /^https:\/\/\S+$/i.test(url) ? { url } : WORKSPACE_FILE.test(file) ? { file } : undefined;
+        if (source) actions.push({ do: 'photo', ...source, ...(caption.trim() ? { caption } : {}), reply: action.reply !== false });
         break;
+      }
+      case 'delete':
+      case 'pin': {
+        const id = action.message_id;
+        actions.push(typeof id === 'number' && Number.isInteger(id) && id > 0 ? { do: action.do, message_id: id } : { do: action.do });
+        break;
+      }
       case 'ask':
         if (str('prompt', 2000).trim()) actions.push({ do: 'ask', prompt: str('prompt', 2000) });
         break;
+      case 'api': {
+        const params = action.params && typeof action.params === 'object' && !Array.isArray(action.params) ? action.params : {};
+        if (str('method', 60)) actions.push({ do: 'api', method: str('method', 60), params: params as Record<string, unknown> });
+        break;
+      }
       default:
         break;
     }
@@ -254,14 +289,24 @@ export async function runHooks(
   topic: string | undefined,
   edited: boolean,
 ): Promise<HookOutcome[]> {
-  const hooks = load(chatId).filter((hook) => hook.enabled);
+  return runHooksForEvent(chatId, uid, buildHookEvent(msg, topic, edited));
+}
+
+/**
+ * Run the group's enabled hooks on any event: a message, or a button press, reaction
+ * or poll vote (those carry no message of their own, see group.ts).
+ */
+export async function runHooksForEvent(chatId: number, uid: number, event: Record<string, unknown>): Promise<HookOutcome[]> {
+  // A hook only sees the kinds of event it asked for: older hooks were written for messages.
+  const type = event.event as HookEventType;
+  const hooks = load(chatId).filter((hook) => hook.enabled && (hook.events ?? DEFAULT_EVENTS).includes(type));
   if (!hooks.length) return [];
 
   const results = await runHookScripts(
     chatId,
     uid,
     hooks.map((hook) => hook.file),
-    JSON.stringify(buildHookEvent(msg, topic, edited)),
+    JSON.stringify(event),
   );
 
   const outcomes: HookOutcome[] = [];

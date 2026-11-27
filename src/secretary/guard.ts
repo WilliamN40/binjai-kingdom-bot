@@ -23,6 +23,8 @@ export interface GuardOptions {
   webSearch: boolean;
   /** Full names of the bot-implemented tools offered in this run. */
   ownTools: string[];
+  /** MCP servers the group added; all their tools run inside the group's sandbox. */
+  mcpServers?: string[];
 }
 
 const deny = (reason: string): GuardDecision => ({ allowed: false, reason });
@@ -53,6 +55,7 @@ export function checkToolUse(
   const outside = "You can only read files inside this group's record. Use run_command for files in the workspace.";
 
   if (options.ownTools.includes(toolName)) return allow;
+  if (options.mcpServers?.some((name) => toolName.startsWith(`mcp__${name}__`))) return allow;
 
   switch (toolName) {
     case 'Read':

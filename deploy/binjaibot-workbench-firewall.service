@@ -1,0 +1,18 @@
+# Re-applies the binjaibot workbench firewall (deploy/workbench-firewall.sh) at boot and
+# whenever docker starts. Install:
+#   sudo install -m 755 deploy/workbench-firewall.sh /usr/local/sbin/binjaibot-workbench-firewall.sh
+#   sudo install -m 644 deploy/binjaibot-workbench-firewall.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now binjaibot-workbench-firewall.service
+[Unit]
+Description=Firewall for the binjaibot workbench network (public internet only)
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/binjaibot-workbench-firewall.sh
+
+[Install]
+WantedBy=multi-user.target docker.service
