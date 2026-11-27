@@ -659,3 +659,34 @@ test('hooks only get the events they ask for, and risky Telegram calls stay clos
   const reply = await tg.prepareCall('sendMessage', { text: 'hi', reply_parameters: { message_id: 1, chat_id: -42 } }, { chatId: -100777 }, async () => Buffer.alloc(0));
   assert.equal((reply.reply_parameters as { chat_id: number }).chat_id, -100777);
 });
+
+test('notes are numbered and can be edited or removed', () => {
+  const chatId = -1009990090;
+  transcript.appendNote(chatId, 'Answer sean in Chinese', 'sean (@sean)');
+  transcript.appendNote(chatId, 'Dinner on Friday', 'Alice (@alice)');
+  transcript.appendNote(chatId, 'Answer Alice in Javanese', 'Alice (@alice)');
+  assert.match(transcript.readNotes(chatId), /^#1 - \[.*\(asked by sean \(@sean\)\) Answer sean in Chinese/);
+  assert.deepEqual(transcript.listNotes(chatId).map((n) => n.askedBy), ['sean (@sean)', 'Alice (@alice)', 'Alice (@alice)']);
+
+  const edited = transcript.editNote(chatId, 2, 'Dinner moved to Saturday', 'Alice (@alice)');
+  assert.equal(edited?.text, 'Dinner moved to Saturday');
+  assert.match(transcript.listNotes(chatId)[1].line, /asked by Alice \(@alice\)\) Dinner moved to Saturday \(edited by Alice/);
+
+  assert.deepEqual(transcript.removeNotes(chatId, [1, 3]).map((n) => n.text), ['Answer sean in Chinese', 'Answer Alice in Javanese']);
+  assert.deepEqual(transcript.listNotes(chatId).map((n) => [n.number, n.text]), [[1, 'Dinner moved to Saturday (edited by Alice (@alice))']]);
+  assert.equal(transcript.editNote(chatId, 9, 'x', 'A'), undefined);
+});
+
+test('votes in the bot\'s polls are described for the record', async () => {
+  const polls = await import('../src/secretary/polls.js');
+  polls.rememberPoll('p1', { chatId: -1009990091, messageId: 120, question: 'Dinner?', options: ['Song Fa', 'Hai Di Lao'], anonymous: false, at: new Date().toISOString() });
+  polls.resetPollCache(); // survives a restart
+  const poll = polls.findPoll('p1')!;
+  assert.equal(polls.describeVote(poll, 'Dana (@dana_k)', [1]), '* Dana (@dana_k) voted for "Hai Di Lao" in the poll "Dinner?" (msg 120)');
+  assert.match(polls.describeVote(poll, 'Dana', []), /took back their vote/);
+  assert.equal(
+    polls.describeResult(poll, [{ text: 'Song Fa', voter_count: 3 }, { text: 'Hai Di Lao', voter_count: 1 }], 4),
+    '* The poll "Dinner?" (msg 120) closed: Song Fa 3, Hai Di Lao 1 (4 voters)',
+  );
+  assert.equal(polls.findPoll('nope'), undefined);
+});
