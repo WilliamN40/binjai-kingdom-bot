@@ -24,6 +24,11 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o 
 # containers (see runner.mjs). A static binary; the daemon is the host's.
 COPY --from=docker:29-cli /usr/local/bin/docker /usr/local/bin/docker
 
+# ntubus: live NTU campus shuttle buses, as a command for scripts and hooks and as an MCP
+# server for the secretary (ntubus mcp). One file, no dependencies.
+COPY workbench/ntubus/ntubus.mjs /opt/ntubus/ntubus.mjs
+RUN chmod 755 /opt/ntubus/ntubus.mjs && ln -s /opt/ntubus/ntubus.mjs /usr/local/bin/ntubus
+
 COPY runner.mjs /opt/sandbox/runner.mjs
 
 # Starts as root only to set the firewall and switch each command to its group's unprivileged user

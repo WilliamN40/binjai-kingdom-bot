@@ -65,6 +65,32 @@ export function listMcpServers(chatId: number): McpServer[] {
   return [...load(chatId)];
 }
 
+/**
+ * Servers that ship with this deployment and are on for every group, from
+ * SECRETARY_BUILTIN_MCP ("name=command; other=command"). The commands are tools
+ * installed in the sandbox image, so they survive a workspace or machine reset.
+ * A group that adds its own server under the same name replaces the built-in one.
+ */
+export function builtinMcpServers(): McpServer[] {
+  const servers: McpServer[] = [];
+  for (const entry of config.SECRETARY_BUILTIN_MCP.split(';')) {
+    const cut = entry.indexOf('=');
+    if (cut === -1) continue;
+    const name = entry.slice(0, cut).trim().toLowerCase();
+    const command = entry.slice(cut + 1).trim();
+    if (!command || mcpNameProblem(name) || servers.some((s) => s.name === name)) continue;
+    servers.push({ name, command, description: 'built into this bot', enabled: true, tools: [], createdBy: 'the bot', createdAt: '' });
+  }
+  return servers;
+}
+
+/** What a group can actually use right now: the built-in servers plus its own enabled ones. */
+export function activeMcpServers(chatId: number): McpServer[] {
+  const own = load(chatId);
+  const builtin = builtinMcpServers().filter((b) => !own.some((s) => s.name === b.name));
+  return [...builtin, ...own.filter((s) => s.enabled)];
+}
+
 export function mcpNameProblem(name: string): string | undefined {
   if (!NAME_PATTERN.test(name)) return 'A server name is 2-31 characters: lowercase letters, digits, "-" and "_", starting with a letter.';
   if (RESERVED.has(name)) return `"${name}" is taken by the bot's own tools.`;
@@ -120,6 +146,7 @@ export function forgetMcpServers(chatId: number): void {
 }
 
 export function describeMcpServer(server: McpServer): string {
+  if (!server.createdAt) return `[${server.name}] on, built into this bot (its tools are mcp__${server.name}__*; it cannot be removed from the chat)`;
   const tools = server.tools.length ? server.tools.slice(0, 12).join(', ') + (server.tools.length > 12 ? ', …' : '') : 'no tools';
   return `[${server.name}] ${server.enabled ? 'on' : 'off'}, by ${server.createdBy}: ${server.description} (tools: ${tools})`;
 }
@@ -141,7 +168,7 @@ function bridgeLaunch(): { command: string; args: string[] } {
 export function sdkMcpServers(chatId: number, uid: number): Record<string, { type: 'stdio'; command: string; args: string[]; env: Record<string, string> }> {
   const launch = bridgeLaunch();
   const result: Record<string, { type: 'stdio'; command: string; args: string[]; env: Record<string, string> }> = {};
-  for (const server of load(chatId).filter((s) => s.enabled)) {
+  for (const server of activeMcpServers(chatId)) {
     result[server.name] = {
       type: 'stdio',
       command: launch.command,
