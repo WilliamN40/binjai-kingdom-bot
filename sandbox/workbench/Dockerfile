@@ -31,6 +31,11 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o 
  && apt-get install -y --no-install-recommends gh \
  && rm -rf /var/lib/apt/lists/*
 
+# ntubus: live NTU campus shuttle buses, as a command for scripts and hooks and as an MCP
+# server for the secretary (ntubus mcp). One file, no dependencies.
+COPY ntubus/ntubus.mjs /opt/ntubus/ntubus.mjs
+RUN chmod 755 /opt/ntubus/ntubus.mjs && ln -s /opt/ntubus/ntubus.mjs /usr/local/bin/ntubus
+
 WORKDIR /work
 
 # tini reaps the background processes that commands leave behind; the container itself just waits.

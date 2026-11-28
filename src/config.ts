@@ -73,6 +73,9 @@ const envSchema = z.object({
   SECRETARY_DIGEST_MODEL: z.string().default('claude-haiku-5-5'),
   // Weekly backup of all records, sent to the owners' private chats
   SECRETARY_BACKUPS: z.string().default('true').transform(toBool),
+  // MCP servers every group gets, as "name=command; other=command". The commands are tools
+  // installed in the sandbox image, e.g. "ntubus=ntubus mcp" for NTU campus buses.
+  SECRETARY_BUILTIN_MCP: z.string().default(''),
   // The bot's own repository, so the secretary can propose changes to itself as pull requests
   BOT_REPO_URL: z.string().default(''),
   // Let the owner deploy a commit from the chat with /deploy (needs deploy/install-deployer.sh on the host)

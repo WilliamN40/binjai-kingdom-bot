@@ -50,6 +50,7 @@ import { cancelSchedule, createSchedule, describeSchedule, listSchedules, repeat
 import { listSecrets } from './secrets.js';
 import { methodLevel } from './telegram-api.js';
 import {
+  builtinMcpServers,
   describeMcpServer,
   listMcpServers,
   probeMcpServer,
@@ -325,7 +326,7 @@ export function describeSettings(group: GroupState): string {
     `Repeats: reminders and scripts at most every ${repeatLimits(group.chatId).seconds} s, tasks at most every ${repeatLimits(group.chatId).taskMinutes} min`,
     `Owner: ${owners.join(', ') || 'none'}; managers: ${managers.join(', ') || 'none'} (they can change these settings)`,
     `Secrets (environment variables in the workspace): ${listSecrets(group.chatId).map((s) => s.name).join(', ') || 'none'}`,
-    `MCP servers: ${listMcpServers(group.chatId).map(describeMcpServer).join('; ') || 'none'}`,
+    `MCP servers: ${[...builtinMcpServers().filter((b) => !listMcpServers(group.chatId).some((s) => s.name === b.name)), ...listMcpServers(group.chatId)].map(describeMcpServer).join('; ') || 'none'}`,
   ].join('\n');
 }
 
