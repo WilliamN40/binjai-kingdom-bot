@@ -40,15 +40,15 @@ const envSchema = z.object({
   OWNER_CLAIM_CODE: z.string().optional(),
   // Model for group answers (empty = CLAUDE_MODEL)
   SECRETARY_MODEL: z.string().default(''),
-  SECRETARY_EFFORT: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).default('medium'),
+  SECRETARY_EFFORT: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).default('high'),
   // Extra house rules for the secretary's replies (tone, words to avoid, language), in plain words
   SECRETARY_INSTRUCTIONS: z.string().default(''),
   // Timezone used for transcript timestamps and daily file boundaries
   SECRETARY_TIMEZONE: z.string().default('Asia/Singapore'),
   // Let the secretary search the web for questions that are not about the group
   SECRETARY_WEB_SEARCH: z.string().default('true').transform(toBool),
-  SECRETARY_MAX_TURNS: z.string().default('80').transform(toInt),
-  SECRETARY_TIMEOUT_MS: z.string().default('1200000').transform(toInt),
+  SECRETARY_MAX_TURNS: z.string().default('150').transform(toInt),
+  SECRETARY_TIMEOUT_MS: z.string().default('1800000').transform(toInt),
   // How much recent transcript is placed directly in each prompt (older history is searched on demand)
   SECRETARY_CONTEXT_CHARS: z.string().default('40000').transform(toInt),
   SECRETARY_MAX_CONCURRENT: z.string().default('4').transform(toInt),
